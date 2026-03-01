@@ -2,94 +2,135 @@
 
 A web-based tool to convert Bambu Lab .3mf projects to Snapmaker U1 format, preserving multi-color painting and filament assignments.
 
-**Live version:** [https://bl2u1.nbn.cat](https://bl2u1.nbn.cat)
-
 ## Features
 
-- Converts Bambu Lab/Bambu Studio .3mf files to Snapmaker U1 compatible format
-- Preserves color painting and multi-color assignments
-- Applies the 0.20mm Standard print profile for U1
-- Remaps filament types to U1 compatible profiles
-- Automatically enables Tree Supports (auto) if the original model has supports enabled
-- Supports up to 4 filaments/colors
-- Simple drag & drop interface
-- No installation required (web-based)
+- **Single File Conversion**: Upload and convert individual .3mf files with custom filament mapping
+- **Batch Conversion**: Convert entire folders of files with automatic filament type detection
+- **Auto-Center**: Automatically re-centers models from Bambu bed (256mm) to U1 bed (230mm)
+- **Drop-to-Bed**: Fixes Z offset issues for proper bed adhesion
+- **Unlimited Colors**: Supports any number of filaments (swap filament between colors)
+- **Source Folder Monitoring**: Detects new files and converts them with one click
+- **Conversion History**: Tracks converted files to skip duplicates
+- **Tree Support Detection**: Automatically enables supports if original file had them
+- **Docker Support**: Easy deployment with Docker Compose
 
 ## How It Works
 
+### Single File Mode
 1. Upload your Bambu Lab .3mf file
 2. Review and adjust filament colors/types if needed
 3. Click "Convert and Download"
 4. Open the converted file in **Snapmaker Orca** for final slicing
 
-## Self-Hosting
+### Batch Mode
+1. Click "Batch Convert" tab
+2. Select a folder with .3mf files
+3. Review detected Bambu files (Snapmaker files are automatically skipped)
+4. Click "Convert All" - files are saved to your configured output folder
 
-### Requirements
+### Source Folder Monitoring
+1. Configure source and output folders in Settings
+2. New Bambu files appear with a badge count
+3. Click "Convert All New" to process them sequentially with progress display
 
-- Python 3.8+
-- Flask
+## Installation
 
-### Installation
+### Docker (Recommended)
 
 ```bash
-# Clone the repository
-git clone https://github.com/josua/bl2u1.git
-cd bl2u1
+git clone https://github.com/ryvin/bambu-to-snapmaker-converter.git
+cd bambu-to-snapmaker-converter
 
-# Install dependencies
+# Edit docker-compose.yml to set your volume mounts
+docker-compose up -d
+```
+
+The application will be available at `http://localhost:8090`
+
+### Manual Installation
+
+```bash
+git clone https://github.com/ryvin/bambu-to-snapmaker-converter.git
+cd bambu-to-snapmaker-converter
+
 pip install flask
-
-# Run the application
 python app.py
 ```
 
 The application will be available at `http://localhost:8080`
 
-### Project Structure
+## Configuration
+
+### Docker Volumes
+
+Edit `docker-compose.yml` to map your local folders:
+
+```yaml
+volumes:
+  - /path/to/downloads:/mnt/e/Downloads      # Source folder for new files
+  - /path/to/converted:/mnt/e/3D/converted_u1 # Output folder
+```
+
+### Settings (in-app)
+
+- **Output Folder**: Where converted files are saved
+- **Source Folder**: Monitored for new Bambu files
+- **Auto-detect new files**: Enable/disable source folder monitoring
+- **Skip exact duplicates**: Skip files with matching MD5 hash
+
+## Project Structure
 
 ```
-bambu-to-u1-web/
-├── app.py                    # Flask backend
+bambu-to-snapmaker-converter/
+├── app.py                    # Flask backend with all conversion logic
+├── history.py                # Conversion history and settings manager
 ├── templates/
-│   └── index.html            # Frontend interface
+│   └── index.html            # Single-page frontend (Tailwind CSS)
 ├── uploads/                  # Temporary file storage (auto-cleaned)
 ├── u1_template.3mf           # U1 template without supports
 ├── u1_template_supports.3mf  # U1 template with tree supports
-└── filament_types.3mf        # Available filament profiles
+├── filament_types.3mf        # Available U1 filament profiles
+├── Dockerfile
+└── docker-compose.yml
 ```
-
-### Template Files
-
-The converter requires template .3mf files configured for Snapmaker U1:
-
-- `u1_template.3mf` - Base template with 0.20mm Standard profile, supports disabled
-- `u1_template_supports.3mf` - Same as above but with Tree Supports (auto) enabled
-- `filament_types.3mf` - Reference file containing available U1 filament profiles
 
 ## Technical Details
 
-The converter performs the following transformations:
+### Conversion Process
 
 1. **Printer Profile**: Changes printer settings from Bambu Lab to Snapmaker U1
-2. **Filament Mapping**: Remaps filament types to U1 compatible profiles
-3. **Color Preservation**: Maintains all color painting data from the original file
-4. **Support Detection**: Checks `different_settings_to_system` for `enable_support` and uses the appropriate template
-5. **Filament Padding**: Ensures 4 filaments are always configured (fills empty slots with white PLA)
+2. **Filament Mapping**: Auto-maps filament types (PLA→PLA, PETG→PETG-HF, etc.)
+3. **Color Preservation**: Maintains all color painting data from the original
+4. **Auto-Center**: Re-centers model X,Y from 128,128 (Bambu) to 115,115 (U1)
+5. **Z Offset Fix**: Removes Z translation from part matrices for bed adhesion
+6. **Support Detection**: Enables Tree Supports if original had supports enabled
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web interface |
+| `/analyze` | POST | Analyze single file, return filaments |
+| `/convert` | POST | Convert single file with custom colors |
+| `/batch-analyze` | POST | Analyze multiple files |
+| `/batch-convert` | POST | Convert all analyzed files |
+| `/convert-file` | POST | Convert single file from source folder |
+| `/check-new` | GET | List new files in source folder |
+| `/settings` | GET/POST | Get or update settings |
+| `/history` | GET | Get conversion history |
 
 ### File Cleanup
 
-Uploaded files are automatically deleted after 8 hours to save disk space.
+Uploaded files are automatically deleted after 8 hours.
 
 ## Limitations
 
-- Maximum 4 filaments/colors (U1 hardware limitation)
-- The converted file must be sliced in Snapmaker Orca before printing
+- Converted files must be sliced in Snapmaker Orca before printing
 - Some advanced Bambu-specific features may not transfer
 
 ## Contributing
 
 Contributions are welcome! Feel free to:
-
 - Report bugs
 - Suggest features
 - Submit pull requests
@@ -100,9 +141,5 @@ MIT License - feel free to use, modify, and distribute.
 
 ## Acknowledgments
 
+- Original project by [josuanbn](https://github.com/josuanbn/bl2u1)
 - Snapmaker community for feedback and testing
-- Bambu Lab for the excellent .3mf format documentation
-
-## Support
-
-If you find this tool useful, consider [buying me a coffee](https://buymeacoffee.com/josuanbn)!
