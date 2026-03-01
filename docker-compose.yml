@@ -1,18 +1,14 @@
-version: '3.8'
-
 services:
   converter:
     build: .
     container_name: bambu-to-u1-converter
     ports:
-      - "8080:8080"
+      - "8090:8080"
     volumes:
       # Persist conversion history and settings
       - ./data:/app/data
-      # Mount source folder for new file detection (optional)
-      # - /path/to/your/downloads:/app/source:ro
-      # Mount output folder for converted files (optional)
-      # - /path/to/your/output:/app/converted_u1
+      # Mount E:\ drive for file access
+      - /mnt/e:/mnt/e
     environment:
       - FLASK_ENV=production
     restart: unless-stopped

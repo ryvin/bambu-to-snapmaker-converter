@@ -913,6 +913,65 @@ def convert_new_files():
     })
 
 
+@app.route('/convert-file', methods=['POST'])
+def convert_single_source_file():
+    """Convert a single file from the source folder."""
+    data = request.json
+    filepath = data.get('filepath')
+
+    if not filepath:
+        return jsonify({'error': 'No filepath provided'}), 400
+
+    if not os.path.isfile(filepath):
+        return jsonify({'error': 'File not found'}), 404
+
+    settings = history_manager.get_settings()
+    output_folder = settings.get('output_folder', './converted_u1')
+    os.makedirs(output_folder, exist_ok=True)
+
+    filename = os.path.basename(filepath)
+
+    # Check if it's a Bambu file
+    if not is_bambu_file(filepath):
+        return jsonify({'error': 'Not a Bambu Lab file', 'skipped': True}), 200
+
+    # Hash the file
+    file_hash = history_manager.hash_file(filepath)
+
+    # Check if already converted
+    existing = history_manager.find_by_hash(file_hash)
+    if existing and settings.get('delete_duplicates', True):
+        return jsonify({'skipped': True, 'reason': 'Already converted'}), 200
+
+    # Parse filaments and auto-map
+    filaments = parse_bambu_filaments(filepath)
+    auto_colors = auto_map_filaments(filaments)
+
+    # Generate output filename with versioning
+    base_name = os.path.splitext(filename)[0]
+    output_filename = f"{base_name}_U1.3mf"
+    output_path = os.path.join(output_folder, output_filename)
+
+    # Version if exists
+    version = 2
+    while os.path.exists(output_path):
+        output_filename = f"{base_name}_U1_v{version}.3mf"
+        output_path = os.path.join(output_folder, output_filename)
+        version += 1
+
+    success, error = convert_single_file(filepath, output_path, auto_colors)
+
+    if success:
+        history_manager.add_converted(filename, file_hash, output_filename, len(filaments))
+        return jsonify({
+            'success': True,
+            'output_filename': output_filename,
+            'filaments': len(filaments)
+        })
+    else:
+        return jsonify({'error': error}), 500
+
+
 if __name__ == '__main__':
     import os
     debug = os.environ.get('FLASK_ENV', 'development') == 'development'

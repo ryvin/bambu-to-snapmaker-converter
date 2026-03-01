@@ -270,7 +270,11 @@
 
         <div id="loading" class="hidden mt-6 text-center">
             <i class="fa-solid fa-circle-notch fa-spin text-4xl text-cyan-400"></i>
-            <p class="mt-2 text-slate-400">Processing...</p>
+            <p id="loading-status" class="mt-2 text-slate-400">Processing...</p>
+            <div class="mt-3 w-64 mx-auto bg-slate-700 rounded-full h-2">
+                <div id="loading-bar" class="bg-cyan-500 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+            <p id="loading-detail" class="mt-1 text-xs text-slate-500"></p>
         </div>
     </div>
 
@@ -341,34 +345,54 @@
             handleFile(file);
         });
 
+        // Progress helper function
+        function updateProgress(status, percent, detail = '') {
+            document.getElementById('loading-status').textContent = status;
+            document.getElementById('loading-bar').style.width = percent + '%';
+            document.getElementById('loading-detail').textContent = detail;
+        }
+
+        function resetProgress() {
+            updateProgress('Processing...', 0, '');
+        }
+
         async function handleFile(file) {
             if (!file) return;
 
             // Show loading
             document.getElementById('step1').classList.add('opacity-50', 'pointer-events-none');
             document.getElementById('loading').classList.remove('hidden');
+            updateProgress('Uploading file...', 10, file.name);
 
             const formData = new FormData();
             formData.append('file', file);
 
             try {
+                updateProgress('Analyzing filaments...', 30, 'Reading 3MF structure');
                 const response = await fetch('/analyze', { method: 'POST', body: formData });
                 const data = await response.json();
 
                 if (!response.ok) throw new Error(data.error);
 
+                updateProgress('Analysis complete', 100, `Found ${data.filaments.length} filament(s)`);
+
                 currentSessionId = data.session_id;
                 currentOriginalName = data.original_name || 'Converted';
                 renderFilaments(data.filaments);
 
+                // Brief pause to show completion
+                await new Promise(r => setTimeout(r, 300));
+
                 // Move to step 2
                 document.getElementById('loading').classList.add('hidden');
+                resetProgress();
                 document.getElementById('step1').classList.add('hidden');
                 document.getElementById('step2').classList.remove('hidden');
 
             } catch (err) {
                 alert("Error: " + err.message);
                 document.getElementById('loading').classList.add('hidden');
+                resetProgress();
                 document.getElementById('step1').classList.remove('opacity-50', 'pointer-events-none');
             }
         }
@@ -484,7 +508,13 @@
                 colors[id] = { color: color, type: type };
             });
 
+            // Show progress
+            document.getElementById('step2').classList.add('opacity-50', 'pointer-events-none');
+            document.getElementById('loading').classList.remove('hidden');
+            updateProgress('Starting conversion...', 10, 'Preparing files');
+
             try {
+                updateProgress('Converting to U1 format...', 40, 'Modifying 3MF structure');
                 const res = await fetch('/convert', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -494,19 +524,34 @@
                         original_name: currentOriginalName
                     })
                 });
+
+                updateProgress('Processing response...', 70, 'Building output file');
                 const data = await res.json();
 
                 if (data.download_url) {
+                    updateProgress('Conversion complete!', 100, 'Starting download...');
+                    await new Promise(r => setTimeout(r, 300));
+
                     // Use original filename for download
                     const downloadUrl = data.download_name
                         ? `${data.download_url}?name=${encodeURIComponent(data.download_name)}`
                         : data.download_url;
                     window.location.href = downloadUrl;
+
+                    // Hide progress after download starts
+                    setTimeout(() => {
+                        document.getElementById('loading').classList.add('hidden');
+                        document.getElementById('step2').classList.remove('opacity-50', 'pointer-events-none');
+                        resetProgress();
+                    }, 500);
                 } else {
-                    alert("Conversion Error");
+                    throw new Error(data.error || "Conversion Error");
                 }
             } catch (e) {
-                alert("Connection Error");
+                alert("Error: " + e.message);
+                document.getElementById('loading').classList.add('hidden');
+                document.getElementById('step2').classList.remove('opacity-50', 'pointer-events-none');
+                resetProgress();
             }
         });
 
@@ -538,16 +583,25 @@
         async function handleBatchFiles(files) {
             if (!files || files.length === 0) return;
 
+            // Show loading immediately
+            document.getElementById('batch-step1').classList.add('opacity-50', 'pointer-events-none');
+            document.getElementById('loading').classList.remove('hidden');
+            updateProgress('Scanning files...', 5, `Found ${files.length} total files`);
+
             // Filter to .3mf files only
             const threemfFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.3mf'));
+
+            updateProgress('Filtering .3mf files...', 15, `${threemfFiles.length} of ${files.length} are .3mf files`);
+
             if (threemfFiles.length === 0) {
-                alert('No .3mf files found');
+                alert('No .3mf files found in selection');
+                document.getElementById('loading').classList.add('hidden');
+                document.getElementById('batch-step1').classList.remove('opacity-50', 'pointer-events-none');
+                resetProgress();
                 return;
             }
 
-            // Show loading
-            document.getElementById('batch-step1').classList.add('opacity-50', 'pointer-events-none');
-            document.getElementById('loading').classList.remove('hidden');
+            updateProgress('Uploading files...', 25, `Uploading ${threemfFiles.length} .3mf files`);
 
             const formData = new FormData();
             threemfFiles.forEach(file => {
@@ -555,10 +609,13 @@
             });
 
             try {
+                updateProgress('Analyzing files...', 50, 'Checking for Bambu Lab files');
                 const response = await fetch('/batch-analyze', { method: 'POST', body: formData });
                 const data = await response.json();
 
                 if (!response.ok) throw new Error(data.error);
+
+                updateProgress('Analysis complete', 100, `${data.files.length} files ready to convert`);
 
                 batchSessionId = data.batch_session_id;
                 batchFiles = data.files;
@@ -566,8 +623,12 @@
                 // Render batch file list
                 renderBatchFiles(data.files, data.skipped);
 
+                // Brief pause to show completion
+                await new Promise(r => setTimeout(r, 300));
+
                 // Move to step 2
                 document.getElementById('loading').classList.add('hidden');
+                resetProgress();
                 document.getElementById('batch-step1').classList.add('hidden');
                 document.getElementById('batch-step2').classList.remove('hidden');
 
@@ -575,6 +636,7 @@
                 alert("Error: " + err.message);
                 document.getElementById('loading').classList.add('hidden');
                 document.getElementById('batch-step1').classList.remove('opacity-50', 'pointer-events-none');
+                resetProgress();
             }
         }
 
@@ -864,7 +926,7 @@
             document.getElementById('folder-browser').classList.add('hidden');
         });
 
-        // Convert new files button
+        // Convert new files button - sequential conversion with progress
         document.getElementById('convert-new-btn').addEventListener('click', async () => {
             if (newFilesData.length === 0) return;
 
@@ -876,48 +938,65 @@
             const progressBar = document.getElementById('progress-bar');
             const progressText = document.getElementById('progress-text');
 
-            progressBar.style.width = '20%';
-            progressText.textContent = `Converting ${newFilesData.length} new files...`;
+            const total = newFilesData.length;
+            let converted = 0;
+            let skipped = 0;
+            let errors = 0;
 
-            try {
-                const res = await fetch('/convert-new', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({})
-                });
+            // Convert files one at a time
+            for (let i = 0; i < newFilesData.length; i++) {
+                const file = newFilesData[i];
+                const percent = Math.round(((i + 1) / total) * 100);
 
-                progressBar.style.width = '80%';
+                progressBar.style.width = percent + '%';
+                progressText.textContent = `Converting ${i + 1} of ${total}: ${file.filename}`;
 
-                const data = await res.json();
+                try {
+                    const res = await fetch('/convert-file', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ filepath: file.filepath })
+                    });
 
-                if (!res.ok) throw new Error(data.error);
+                    const data = await res.json();
 
-                progressBar.style.width = '100%';
-
-                // Show complete
-                document.getElementById('batch-progress').classList.add('hidden');
-                document.getElementById('batch-complete').classList.remove('hidden');
-
-                document.getElementById('complete-summary').textContent =
-                    `Successfully converted ${data.converted_count} files to ${data.output_folder}.` +
-                    (data.skipped_count > 0 ? ` ${data.skipped_count} skipped.` : '') +
-                    (data.error_count > 0 ? ` ${data.error_count} failed.` : '');
-
-                // Hide download link for server-side conversion (files are saved directly)
-                document.getElementById('batch-download-link').classList.add('hidden');
-
-                // Update badge
-                checkNewFiles();
-
-                // Update history count
-                const histRes = await fetch('/history');
-                const history = await histRes.json();
-                document.getElementById('history-count').textContent = history.length;
-
-            } catch (err) {
-                alert('Conversion Error: ' + err.message);
-                resetBatchMode();
+                    if (data.success) {
+                        converted++;
+                    } else if (data.skipped) {
+                        skipped++;
+                    } else if (data.error) {
+                        errors++;
+                        console.error(`Error converting ${file.filename}: ${data.error}`);
+                    }
+                } catch (err) {
+                    errors++;
+                    console.error(`Failed to convert ${file.filename}: ${err.message}`);
+                }
             }
+
+            // Show complete
+            document.getElementById('batch-progress').classList.add('hidden');
+            document.getElementById('batch-complete').classList.remove('hidden');
+
+            // Get output folder from settings
+            const settingsRes = await fetch('/settings');
+            const settings = await settingsRes.json();
+
+            document.getElementById('complete-summary').textContent =
+                `Successfully converted ${converted} files to ${settings.output_folder}.` +
+                (skipped > 0 ? ` ${skipped} skipped.` : '') +
+                (errors > 0 ? ` ${errors} failed.` : '');
+
+            // Hide download link for server-side conversion (files are saved directly)
+            document.getElementById('batch-download-link').classList.add('hidden');
+
+            // Update badge
+            checkNewFiles();
+
+            // Update history count
+            const histRes = await fetch('/history');
+            const history = await histRes.json();
+            document.getElementById('history-count').textContent = history.length;
         });
 
         // Load settings on page load
