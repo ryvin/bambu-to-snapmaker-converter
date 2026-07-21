@@ -549,3 +549,42 @@ def test_refix_refuses_multiplate(tmp_path):
     assert ok is False
     assert "3" in err and "plate" in err.lower()
     assert not os.path.exists(out)
+
+
+# ===========================================================================
+# Test 15: geometry resolves when a submodel OMITS the core namespace.
+# Real Bambu MeshGraffiti/MakerLab exports write submodels whose <object>/
+# <mesh>/<vertex> are in no namespace; strict {CORE_NS} matching found nothing
+# and refused the whole model as "no resolvable geometry".
+# ===========================================================================
+def test_geometry_resolves_without_core_namespace():
+    main = ET.fromstring(
+        f'<model xmlns="{CORE_NS}" xmlns:p="{PROD_NS}">'
+        f'<resources><object id="1" type="model"><components>'
+        f'<component p:path="/sub.model" objectid="9"/>'
+        f'</components></object></resources>'
+        f'<build><item objectid="1" transform="1 0 0 0 1 0 0 0 1 0 0 0"/></build>'
+        f'</model>'
+    )
+    # Submodel WITHOUT a default core namespace: elements are un-namespaced.
+    sub = ET.fromstring(
+        f'<model xmlns:p="{PROD_NS}"><resources>'
+        f'<object id="9" type="model"><mesh><vertices>'
+        f'<vertex x="0" y="0" z="0"/><vertex x="10" y="20" z="4"/>'
+        f'</vertices></mesh></object></resources></model>'
+    )
+
+    def get_root(path):
+        if path is _MAIN_MODEL:
+            return main
+        return sub if str(path).lstrip('/') == 'sub.model' else None
+
+    corners = []
+    _collect_global_corners(
+        _MAIN_MODEL, "1", [1, 0, 0, 0, 1, 0, 0, 0, 1], [0, 0, 0], get_root, corners
+    )
+    assert corners, "geometry must resolve despite the missing core namespace"
+    xs = [c[0] for c in corners]; ys = [c[1] for c in corners]; zs = [c[2] for c in corners]
+    assert (min(xs), max(xs)) == (0, 10)
+    assert (min(ys), max(ys)) == (0, 20)
+    assert (min(zs), max(zs)) == (0, 4)

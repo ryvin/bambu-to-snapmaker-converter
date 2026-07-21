@@ -328,13 +328,45 @@ def _matmul3(A, B):
     return R
 
 
+def _lname(tag):
+    """Local element/attribute name, namespace-agnostic ('{ns}object' -> 'object').
+
+    Bambu submodels frequently OMIT the default core-namespace declaration, so
+    their <object>/<mesh>/<vertex> elements end up in no namespace. Matching on
+    the local name resolves geometry whether or not the core namespace is
+    declared, instead of silently finding nothing.
+    """
+    return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else tag
+
+
+def _find_child(elem, local):
+    """First direct child whose local name matches, ignoring namespace."""
+    for c in elem:
+        if _lname(c.tag) == local:
+            return c
+    return None
+
+
+def _get_attr(elem, local):
+    """Attribute value by local name, ignoring namespace (plain first)."""
+    v = elem.get(local)
+    if v is not None:
+        return v
+    for k, val in elem.attrib.items():
+        if _lname(k) == local:
+            return val
+    return None
+
+
 def _object_map(root):
     """Return {object_id: <object> element} for a parsed model/submodel root."""
     cache = getattr(root, '_u1_object_map', None)
     if cache is not None:
         return cache
     cache = {}
-    for obj in root.iter(f'{{{CORE_NS}}}object'):
+    for obj in root.iter():
+        if _lname(obj.tag) != 'object':
+            continue
         oid = obj.get('id')
         if oid is not None:
             cache[oid] = obj
@@ -350,16 +382,18 @@ def _object_local_aabb(obj_elem):
     Local axis-aligned bounding box of an object's own mesh, as
     (minx, miny, minz, maxx, maxy, maxz), or None if it has no vertices.
     """
-    mesh = obj_elem.find(f'{{{CORE_NS}}}mesh')
+    mesh = _find_child(obj_elem, 'mesh')
     if mesh is None:
         return None
-    verts = mesh.find(f'{{{CORE_NS}}}vertices')
+    verts = _find_child(mesh, 'vertices')
     if verts is None:
         return None
     minx = miny = minz = math.inf
     maxx = maxy = maxz = -math.inf
     found = False
-    for v in verts.findall(f'{{{CORE_NS}}}vertex'):
+    for v in verts:
+        if _lname(v.tag) != 'vertex':
+            continue
         try:
             x = float(v.get('x'))
             y = float(v.get('y'))
@@ -402,11 +436,13 @@ def _collect_global_corners(file_path, object_id, A, t, get_root, corners, depth
                 for cz in (minz, maxz):
                     corners.append(_apply(A, t, (cx, cy, cz)))
 
-    comps = obj.find(f'{{{CORE_NS}}}components')
+    comps = _find_child(obj, 'components')
     if comps is not None:
-        for comp in comps.findall(f'{{{CORE_NS}}}component'):
+        for comp in comps:
+            if _lname(comp.tag) != 'component':
+                continue
             cobjid = comp.get('objectid')
-            cpath = comp.get(f'{{{PROD_NS}}}path') or file_path
+            cpath = _get_attr(comp, 'path') or file_path
             cA, cT = _parse_transform(
                 comp.get('transform'), f"component objectid={cobjid}"
             )
