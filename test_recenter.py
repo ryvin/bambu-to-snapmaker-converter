@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+Unit + regression tests for the group-recenter / bed-dims / per-item
+drop-to-bed rewrite in app.py.
+
+These are pure-Python tests (no Flask server, no browser). They build minimal
+in-memory 3MF models and a synthetic single-plate .3mf fixture, plus exercise
+the real 6-plate fixture at /mnt/e/Downloads/ButterflyWing_fans_U1.3mf when it
+is present.
+
+Run inside the container:
+    docker exec bambu-to-u1-converter python -m pytest /app/test_recenter.py -v
+"""
+import os
+import json
+import zipfile
+import xml.etree.ElementTree as ET
+
+import pytest
+
+import app
+from app import (
+    ConversionError,
+    BedBounds,
+    parse_printable_area,
+    recenter_and_drop_model,
+    count_plates,
+    convert_single_file,
+    _collect_build_items,
+    _collect_global_corners,
+    _parse_transform,
+    _MAIN_MODEL,
+    CORE_NS,
+    PROD_NS,
+)
+
+REAL_FIXTURE = "/mnt/e/Downloads/ButterflyWing_fans_U1.3mf"
+
+# Bed derived from the actual template -> center (135.5, 136.0).
+BED = BedBounds(0.5, 270.5, 1.0, 271.0)
+BED_CX, BED_CY = 135.5, 136.0
+
+
+# ---------------------------------------------------------------------------
+# Helpers to synthesize minimal 3MF geometry
+# ---------------------------------------------------------------------------
+def _mesh_xml(aabb):
+    """Emit a <mesh> whose 8 corner vertices span the given AABB."""
+    minx, miny, minz, maxx, maxy, maxz = aabb
+    verts = []
+    for x in (minx, maxx):
+        for y in (miny, maxy):
+            for z in (minz, maxz):
+                verts.append(f'<vertex x="{x}" y="{y}" z="{z}"/>')
+    return "<mesh><vertices>" + "".join(verts) + "</vertices><triangles/></mesh>"
+
+
+def build_main_model(objects, items):
+    """
+    objects: list of (id, aabb) -> object with a direct mesh.
+    items: list of (objectid, transform_str_or_None).
+    Returns a parsed ElementTree root (namespaced).
+    """
+    obj_xml = "".join(
+        f'<object id="{oid}" type="model">{_mesh_xml(aabb)}</object>'
+        for oid, aabb in objects
+    )
+    item_xml = ""
+    for oid, tf in items:
+        if tf is None:
+            item_xml += f'<item objectid="{oid}"/>'
+        else:
+            item_xml += f'<item objectid="{oid}" transform="{tf}"/>'
+    xml = (
+        f'<model unit="millimeter" xmlns="{CORE_NS}" xmlns:p="{PROD_NS}">'
+        f"<resources>{obj_xml}</resources>"
+        f"<build>{item_xml}</build>"
+        f"</model>"
+    )
+    return ET.fromstring(xml)
+
+
+def group_bbox_of_3mf(path):
+    """Compute the global XY bbox + Z-min per item for every build item in a
+    converted .3mf, resolving components through submodels (mirrors the app)."""
+    with zipfile.ZipFile(path) as z:
+        main = ET.fromstring(z.read("3D/3dmodel.model").decode("utf-8"))
+        cache = {}
+
+        def reader(p):
+            name = str(p).lstrip("/")
+            if name not in cache:
+                cache[name] = (
+                    ET.fromstring(z.read(name).decode("utf-8"))
+                    if name in z.namelist()
+                    else None
+                )
+            return cache[name]
+
+        def get_root(p):
+            return main if p is _MAIN_MODEL else reader(p)
+
+        items = _collect_build_items(main)
+        gminx = gminy = float("inf")
+        gmaxx = gmaxy = float("-inf")
+        item_minz = []
+        for it in items:
+            A, t = _parse_transform(it.get("transform"), "test")
+            corners = []
+            _collect_global_corners(_MAIN_MODEL, it.get("objectid"), A, t, get_root, corners)
+            if not corners:
+                continue
+            xs = [c[0] for c in corners]
+            ys = [c[1] for c in corners]
+            zs = [c[2] for c in corners]
+            gminx, gmaxx = min(gminx, min(xs)), max(gmaxx, max(xs))
+            gminy, gmaxy = min(gminy, min(ys)), max(gmaxy, max(ys))
+            item_minz.append(min(zs))
+    return gminx, gminy, gmaxx, gmaxy, item_minz
+
+
+def _noreader(_path):
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Synthetic single-plate .3mf fixture (components -> submodels)
+# ---------------------------------------------------------------------------
+def _submodel_xml(object_id, aabb):
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>'
+        f'<model unit="millimeter" xmlns="{CORE_NS}" xmlns:p="{PROD_NS}">'
+        f'<resources><object id="{object_id}" type="model">'
+        f"{_mesh_xml(aabb)}</object></resources><build/></model>"
+    )
+
+
+def make_single_plate_3mf(path, plates=1, empty_slice_info=False):
+    """
+    Build a minimal valid single-plate Bambu-style .3mf that uses
+    components -> submodels (like real BambuStudio output). Two objects:
+      obj 100 -> submodel a.model cube(0..10) lifted z+5, item at (300,300,2)
+      obj 200 -> submodel b.model cube(0..20) identity, item at (350,300,2)
+    model_settings carries a part matrix with z=41.99 to prove relative Z
+    is preserved. `plates` controls how many <plate> blocks (for refuse test).
+
+    ``empty_slice_info`` emits a slice_info.config with a header but NO
+    <filament> nodes (as many real Bambu exports do). Filaments then come only
+    from project_settings.config, exercising the id_mapping decoupling: the
+    extruder remap must still work rather than silently no-op.
+    """
+    main = (
+        f'<?xml version="1.0" encoding="UTF-8"?>'
+        f'<model unit="millimeter" xmlns="{CORE_NS}" xmlns:p="{PROD_NS}" '
+        f'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" '
+        f'requiredextensions="p">'
+        f"<resources>"
+        f'<object id="100" type="model"><components>'
+        f'<component p:path="/3D/Objects/a.model" objectid="1" '
+        f'transform="1 0 0 0 1 0 0 0 1 0 0 5"/>'
+        f"</components></object>"
+        f'<object id="200" type="model"><components>'
+        f'<component p:path="/3D/Objects/b.model" objectid="1" '
+        f'transform="1 0 0 0 1 0 0 0 1 0 0 0"/>'
+        f"</components></object>"
+        f"</resources>"
+        f"<build>"
+        f'<item objectid="100" transform="1 0 0 0 1 0 0 0 1 300 300 2" printable="1"/>'
+        f'<item objectid="200" transform="1 0 0 0 1 0 0 0 1 350 300 2" printable="1"/>'
+        f"</build></model>"
+    )
+
+    plate_blocks = ""
+    for pid in range(1, plates + 1):
+        plate_blocks += (
+            f"<plate>"
+            f'<metadata key="plater_id" value="{pid}"/>'
+            f'<model_instance><metadata key="object_id" value="100"/>'
+            f'<metadata key="instance_id" value="0"/></model_instance>'
+            f"</plate>"
+        )
+    model_settings = (
+        f'<?xml version="1.0" encoding="UTF-8"?><config>'
+        f'<object id="100">'
+        f'<metadata key="name" value="obj a"/>'
+        f'<metadata key="extruder" value="1"/>'
+        f'<part id="1" subtype="normal_part">'
+        f'<metadata key="name" value="button"/>'
+        f'<metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 41.991806 0 0 0 1"/>'
+        f"</part></object>"
+        f'<object id="200">'
+        f'<metadata key="name" value="obj b"/>'
+        f'<metadata key="extruder" value="2"/>'
+        f'<part id="1" subtype="normal_part">'
+        f'<metadata key="name" value="body"/>'
+        f'<metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>'
+        f"</part></object>"
+        f"{plate_blocks}</config>"
+    )
+
+    if empty_slice_info:
+        # Header-only slice_info, like many real Bambu exports: filaments live
+        # only in project_settings.config.
+        slice_info = (
+            f'<?xml version="1.0" encoding="UTF-8"?><config>'
+            f'<header><header_item key="X-BBL-Client-Type" value="slicer"/></header>'
+            f"</config>"
+        )
+    else:
+        slice_info = (
+            f'<?xml version="1.0" encoding="UTF-8"?><config>'
+            f'<header><header_item key="X-BBL-Client-Type" value="slicer"/></header>'
+            f'<plate>'
+            f'<metadata key="index" value="1"/>'
+            f'<metadata key="printer_model_id" value="Bambu Lab X1 Carbon"/>'
+            f'<filament id="1" tray_info_idx="GFA00" type="PLA" color="#FF0000" used_m="1" used_g="1"/>'
+            f'<filament id="2" tray_info_idx="GFA01" type="PLA" color="#00FF00" used_m="1" used_g="1"/>'
+            f"</plate></config>"
+        )
+
+    project_settings = json.dumps(
+        {
+            "printer_model": "Bambu Lab X1 Carbon",
+            "different_settings_to_system": [],
+            "filament_colour": ["#FF0000", "#00FF00"],
+            "filament_type": ["PLA", "PLA"],
+        }
+    )
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("3D/3dmodel.model", main)
+        z.writestr("3D/Objects/a.model", _submodel_xml(1, (0, 0, 0, 10, 10, 10)))
+        z.writestr("3D/Objects/b.model", _submodel_xml(1, (0, 0, 0, 20, 20, 20)))
+        z.writestr("Metadata/model_settings.config", model_settings)
+        z.writestr("Metadata/slice_info.config", slice_info)
+        z.writestr("Metadata/project_settings.config", project_settings)
+
+
+DEFAULT_COLORS = {
+    "1": {"color": "#FF0000FF", "type": "PLA"},
+    "2": {"color": "#00FF00FF", "type": "PLA"},
+}
+
+
+# ===========================================================================
+# Test 1: single-object bbox center == bed center
+# ===========================================================================
+def test_single_object_centered_on_bed():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10))],
+        items=[("1", "1 0 0 0 1 0 0 0 1 200 50 0")],
+    )
+    recenter_and_drop_model(root, _noreader, BED)
+    item = _collect_build_items(root)[0]
+    A, t = _parse_transform(item.get("transform"), "t")
+    # cube spans 10mm; its center after translation must land on bed center.
+    assert t[0] + 5 == pytest.approx(BED_CX, abs=1e-6)
+    assert t[1] + 5 == pytest.approx(BED_CY, abs=1e-6)
+
+
+# ===========================================================================
+# Test 2: multi-object -> relative offsets preserved + group centered
+# ===========================================================================
+def test_multi_object_preserves_relative_offsets():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10)), ("2", (0, 0, 0, 10, 10, 10))],
+        items=[
+            ("1", "1 0 0 0 1 0 0 0 1 300 300 0"),
+            ("2", "1 0 0 0 1 0 0 0 1 360 300 0"),
+        ],
+    )
+    items = _collect_build_items(root)
+    before = [_parse_transform(i.get("transform"), "t")[1] for i in items]
+    recenter_and_drop_model(root, _noreader, BED)
+    after = [_parse_transform(i.get("transform"), "t")[1] for i in items]
+
+    # Every pairwise offset is preserved exactly.
+    assert after[1][0] - after[0][0] == pytest.approx(before[1][0] - before[0][0], abs=1e-9)
+    assert after[1][1] - after[0][1] == pytest.approx(before[1][1] - before[0][1], abs=1e-9)
+
+    # Group bbox center lands on the bed center.
+    xs = [after[0][0], after[0][0] + 10, after[1][0], after[1][0] + 10]
+    ys = [after[0][1], after[0][1] + 10]
+    assert (min(xs) + max(xs)) / 2 == pytest.approx(BED_CX, abs=1e-6)
+    assert (min(ys) + max(ys)) / 2 == pytest.approx(BED_CY, abs=1e-6)
+
+
+# ===========================================================================
+# Test 3: delta applied exactly once (dedup across findall passes)
+# ===========================================================================
+def test_delta_applied_exactly_once():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10)), ("2", (0, 0, 0, 10, 10, 10))],
+        items=[
+            ("1", "1 0 0 0 1 0 0 0 1 300 300 0"),
+            ("2", "1 0 0 0 1 0 0 0 1 360 300 0"),
+        ],
+    )
+    # Namespaced items must be enumerated once, not twice.
+    assert len(_collect_build_items(root)) == 2
+    recenter_and_drop_model(root, _noreader, BED)
+    # A double-shift would overshoot the bed center; verify it did not.
+    after = [_parse_transform(i.get("transform"), "t")[1] for i in _collect_build_items(root)]
+    xs = [after[0][0], after[0][0] + 10, after[1][0], after[1][0] + 10]
+    assert (min(xs) + max(xs)) / 2 == pytest.approx(BED_CX, abs=1e-6)
+
+
+# ===========================================================================
+# Test 4: missing transform attr -> treated as identity, still written
+# ===========================================================================
+def test_missing_transform_treated_as_identity():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10))],
+        items=[("1", None)],  # no transform attribute at all
+    )
+    recenter_and_drop_model(root, _noreader, BED)
+    item = _collect_build_items(root)[0]
+    tf = item.get("transform")
+    assert tf is not None  # identity+delta was written
+    A, t = _parse_transform(tf, "t")
+    assert A == [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    assert t[0] + 5 == pytest.approx(BED_CX, abs=1e-6)
+    assert t[1] + 5 == pytest.approx(BED_CY, abs=1e-6)
+    # Within printable bounds.
+    assert BED.min_x <= t[0] and t[0] + 10 <= BED.max_x
+    assert BED.min_y <= t[1] and t[1] + 10 <= BED.max_y
+
+
+# ===========================================================================
+# Test 5: malformed transform -> ConversionError naming the offending token
+# ===========================================================================
+def test_malformed_transform_wrong_count_raises():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10))],
+        items=[("1", "1 0 0 0 1 0 0 0 1 200 50")],  # 11 values
+    )
+    with pytest.raises(ConversionError) as ei:
+        recenter_and_drop_model(root, _noreader, BED)
+    assert "11" in str(ei.value)
+
+
+def test_malformed_transform_non_numeric_raises():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 10, 10, 10))],
+        items=[("1", "1 0 0 0 1 0 0 0 1 200 NaNaN 0")],
+    )
+    with pytest.raises(ConversionError) as ei:
+        recenter_and_drop_model(root, _noreader, BED)
+    assert "NaNaN" in str(ei.value)  # offending token surfaced
+
+
+# ===========================================================================
+# Test 6: group larger than printable -> ConversionError with dims
+# ===========================================================================
+def test_oversize_group_raises_fit_error():
+    root = build_main_model(
+        objects=[("1", (0, 0, 0, 400, 10, 10))],  # 400mm wide, bed is 270
+        items=[("1", "1 0 0 0 1 0 0 0 1 0 0 0")],
+    )
+    with pytest.raises(ConversionError) as ei:
+        recenter_and_drop_model(root, _noreader, BED)
+    msg = str(ei.value)
+    assert "400" in msg and "270" in msg
+
+
+# ===========================================================================
+# Test 7: per-item drop-to-bed; part relative Z is preserved (not zeroed)
+# ===========================================================================
+def test_part_relative_z_preserved_and_item_dropped(tmp_path):
+    src = str(tmp_path / "in.3mf")
+    out = str(tmp_path / "out.3mf")
+    make_single_plate_3mf(src, plates=1)
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+
+    # (a) The part matrix Z (41.99) survives — no blanket index-11 zeroing.
+    with zipfile.ZipFile(out) as z:
+        ms = z.read("Metadata/model_settings.config").decode("utf-8")
+    assert "41.991806" in ms
+
+    # (b) Each item is dropped to the bed: world min-Z == 0.
+    _, _, _, _, item_minz = group_bbox_of_3mf(out)
+    for mz in item_minz:
+        assert mz == pytest.approx(0.0, abs=1e-6)
+
+
+# ===========================================================================
+# Test 8: multi-plate -> refuse with a clear error (policy iii)
+# ===========================================================================
+def test_multiplate_refused_with_clear_error(tmp_path):
+    src = str(tmp_path / "multi.3mf")
+    out = str(tmp_path / "multi_out.3mf")
+    make_single_plate_3mf(src, plates=3)
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok is False
+    assert "3" in err  # plate count surfaced
+    assert "plate" in err.lower()
+
+
+def test_real_fixture_refused_as_multiplate(tmp_path):
+    if not os.path.exists(REAL_FIXTURE):
+        pytest.skip("real 6-plate fixture not present")
+    out = str(tmp_path / "real_out.3mf")
+    colors = {"1": {"color": "#FF0000FF", "type": "PLA"}}
+    ok, err = convert_single_file(REAL_FIXTURE, out, colors)
+    assert ok is False
+    assert "6" in err  # 6 plates
+    assert "plate" in err.lower()
+
+
+# ===========================================================================
+# Test 9: full regression through convert_single_file on synthetic fixture
+# ===========================================================================
+def test_full_conversion_places_group_on_bed(tmp_path):
+    src = str(tmp_path / "virgin.3mf")
+    out = str(tmp_path / "virgin_out.3mf")
+    make_single_plate_3mf(src, plates=1)
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+
+    # Every output item transform parses as 12 floats.
+    with zipfile.ZipFile(out) as z:
+        main = ET.fromstring(z.read("3D/3dmodel.model").decode("utf-8"))
+    for it in _collect_build_items(main):
+        A, t = _parse_transform(it.get("transform"), "t")  # raises if malformed
+        assert len(A) == 9 and len(t) == 3
+
+    # Group bbox is a subset of the printable area and centered on the bed.
+    gminx, gminy, gmaxx, gmaxy, _ = group_bbox_of_3mf(out)
+    assert gminx >= BED.min_x - 1e-6
+    assert gmaxx <= BED.max_x + 1e-6
+    assert gminy >= BED.min_y - 1e-6
+    assert gmaxy <= BED.max_y + 1e-6
+    assert (gminx + gmaxx) / 2 == pytest.approx(BED_CX, abs=1e-6)
+    assert (gminy + gmaxy) / 2 == pytest.approx(BED_CY, abs=1e-6)
+
+
+# ===========================================================================
+# Test 10: bed bounds derived from template (guards constant reintroduction)
+# ===========================================================================
+def test_bed_bounds_from_template():
+    with zipfile.ZipFile("u1_template.3mf") as z:
+        ps = json.loads(z.read("Metadata/project_settings.config").decode("utf-8"))
+    bed = parse_printable_area(ps)
+    assert (bed.min_x, bed.max_x, bed.min_y, bed.max_y) == (0.5, 270.5, 1.0, 271.0)
+    assert bed.center_x == pytest.approx(135.5)
+    assert bed.center_y == pytest.approx(136.0)
+    # The old hard-coded 230/115 fiction must be gone.
+    assert not hasattr(app, "U1_BED_SIZE")
+    assert not hasattr(app, "U1_BED_CENTER")
+
+
+def test_missing_printable_area_raises():
+    with pytest.raises(ConversionError):
+        parse_printable_area({})
+
+
+# ===========================================================================
+# Test 11: empty slice_info still builds id_mapping (extruders remapped)
+# Regression: real Bambu exports often ship a header-only slice_info.config;
+# tying id_mapping to a slice_info <filament> lookup left it empty, so painted
+# regions were never remapped and the new fail-loud guard would falsely reject.
+# ===========================================================================
+def test_empty_sliceinfo_still_remaps_extruders(tmp_path):
+    src = str(tmp_path / "empty_si.3mf")
+    out = str(tmp_path / "empty_si_out.3mf")
+    make_single_plate_3mf(src, plates=1, empty_slice_info=True)
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err  # must NOT falsely raise "no filament mapping"
+
+    with zipfile.ZipFile(out) as z:
+        ms = ET.fromstring(z.read("Metadata/model_settings.config").decode("utf-8"))
+    refs = {m.get("value") for m in ms.findall('.//metadata[@key="extruder"]')}
+    # Every painted-region extruder points at a kept sequential filament.
+    assert refs and refs <= {"1", "2"}
+
+
+# ===========================================================================
+# Test 12: a painted region with no selected filament still fails loudly
+# (guards that decoupling id_mapping did not disable the fail-loud guard).
+# ===========================================================================
+def test_uncovered_painted_region_raises(tmp_path):
+    src = str(tmp_path / "uncovered.3mf")
+    out = str(tmp_path / "uncovered_out.3mf")
+    make_single_plate_3mf(src, plates=1, empty_slice_info=True)
+
+    # Keep only filament "1"; object 200 references extruder "2" -> uncovered.
+    colors = {"1": {"color": "#FF0000FF", "type": "PLA"}}
+    ok, err = convert_single_file(src, out, colors)
+    assert ok is False
+    assert "2" in err and "extruder" in err.lower()

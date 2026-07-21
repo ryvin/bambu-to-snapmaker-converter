@@ -48,22 +48,24 @@ python app.py
 
 ### Conversion Logic (in `convert_single_file()`)
 1. Reads original Bambu .3mf and extracts project settings
-2. Detects if supports were enabled via `different_settings_to_system` array
-3. Selects appropriate U1 template based on support detection
-4. Modifies internal configs:
-   - `Metadata/slice_info.config` (XML) - printer model, filament mappings
-   - `Metadata/model_settings.config` (XML) - extruder references for painted regions, Z offset fix
+2. **Refuses multi-plate files loudly**: counts `<plate>` blocks in `model_settings.config`; a file with >1 plate is rejected with a clear error (the U1 prints one plate). Per-plate splitting is a planned follow-up.
+3. Detects if supports were enabled via `different_settings_to_system` array
+4. Selects appropriate U1 template based on support detection
+5. **Derives bed bounds from the selected template** (`parse_printable_area`) — never hard-coded
+6. Modifies internal configs:
+   - `Metadata/slice_info.config` (XML) - printer model, filament mappings (when present)
+   - `Metadata/model_settings.config` (XML) - extruder references for painted regions (remapped via `id_mapping`; an unmapped reference raises rather than corrupting color)
    - `Metadata/project_settings.config` (JSON) - printer settings, filament colors/types
-   - `3D/3dmodel.model` (XML) - auto-center model to U1 bed (115,115)
-5. **Auto-center/Drop-to-bed**: Re-centers model X,Y to U1 bed center (115mm) and removes Z offset from part matrices
-6. Pads to 4 filaments (U1 hardware requirement) with white PLA
-7. Writes new .3mf archive
+   - `3D/3dmodel.model` (XML) - group-recenter + per-item drop-to-bed
+7. Pads to 4 filaments (U1 hardware requirement) with white PLA
+8. Writes new .3mf archive
 
-### Auto-Center Feature
-- **Problem**: Bambu files are designed for 256mm bed (center at 128,128), U1 has 230mm bed (center at 115,115)
-- **`recenter_model_transform()`**: Parses 3x4 transform matrix, sets X,Y translation to U1 bed center
-- **`fix_part_matrix_z_offset()`**: Removes Z offset from 4x4 part matrix (fixes adhesion issues)
-- **Constants**: `U1_BED_SIZE = 230`, `U1_BED_CENTER = 115`
+### Auto-Center / Drop-to-Bed Feature (`recenter_and_drop_model()`)
+- **Problem**: Bambu files are laid out for a larger (or multi-plate) canvas; the U1 prints one plate on a rectangular printable area. The center is **not** square-230.
+- **Bed bounds are parsed from the template's `printable_area` polygon** → bounds `[0.5, 270.5] × [1, 271]`, center **(135.5, 136.0)**. Independent X/Y always. (`U1_BED_SIZE`/`U1_BED_CENTER` constants were removed — they encoded a wrong 230/115 square bed that placed models off-bed and could crash the printer with "Move out of range".)
+- **Group recenter, not per-item**: computes the mesh-derived global XY bounding box over **all** build items (resolving `<component>` submodels through their transforms), then applies a **single rigid delta** so the group's bbox center lands on the bed center. Every item's rotation/scale and all inter-item offsets are preserved (multi-object layouts stay intact instead of collapsing onto one point).
+- **Per-item drop-to-bed**: each item's Z translation is reduced by its own world-space minimum Z, so each part sits on the bed **without** flattening intentional relative Z between parts (the old blanket zeroing of every part matrix's `m23` destroyed that).
+- **Fail-loud**: raises `ConversionError` on malformed transforms (naming the object + offending token), no resolvable geometry, or a group that cannot fit the printable area. Helpers raise; `convert_single_file` catches at its boundary → `(False, message)` + logged traceback.
 
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)
@@ -78,12 +80,52 @@ python app.py
 
 ### Testing
 ```bash
-# Run Playwright UI tests (21 tests)
+# Run Playwright UI tests (21 tests, needs a live server on :8085 + chromium)
 python3 -m pytest test_batch.py -v
 
 # Run History module tests (8 tests)
 python3 -m pytest test_history.py -v
 
+# Run recenter / bed-dims / drop-to-bed + fail-loud tests (15 tests, pure Python)
+python3 -m pytest test_recenter.py -v
+
 # Run all tests
 python3 -m pytest -v
 ```
+
+`test_recenter.py` builds minimal in-memory 3MF models and a synthetic
+single-plate fixture (no server/browser needed). It asserts: group recenter to
+the template-derived bed center, relative offsets and part-Z preserved, delta
+applied exactly once, multi-plate refusal, fail-loud on malformed transforms /
+oversize groups, and that `id_mapping` is built even when `slice_info.config`
+carries no `<filament>` nodes (extruders still remap; uncovered regions raise).
+
+
+## ECC Integration
+
+**Rule packs in effect:** `common`, `python`, `web`.
+
+**Primary skills:**
+- `documentation-lookup` — .3mf spec, Bambu Lab project metadata, Snapmaker U1 filament metadata
+- `tdd` — `test_batch.py` exists; lean on it. Conversion correctness is testable on fixture files.
+- `regex-vs-llm-structured-text` — .3mf is XML; parse it deterministically
+- `python-fastapi` rule isn't a 1:1 match (this is Flask) but `python/patterns.md` still applies
+- `search-first` — `filament_types.3mf` is the truth table; check it before adding new filament inference
+
+**Commands:**
+- `/ecc:plan` before changing the converter pipeline or filament-mapping logic
+- `/ecc:harness-audit` to capture Docker build/run and `batch_cli.py` invocation
+- `/ecc:quality-gate` on every commit; conversion bugs corrupt user files
+
+**Project-specific instincts:**
+1. **`filament_types.3mf` is the reference filament table.** Don't hardcode filament metadata elsewhere.
+2. **Multi-color painting and filament assignments are the differentiator.** Conversion fidelity here is the product. Test on fixtures with multi-color paint before any release.
+3. **`conversion_history.json` is the user-facing log.** Keep schema stable.
+4. **Batch CLI and Flask app share core converter.** Don't duplicate conversion logic across the two surfaces.
+5. **User-uploaded files = untrusted XML.** Use a hardened parser; never `eval`, never let XML reference external entities.
+
+**Verification before shipping:**
+1. `python test_batch.py` and any pytest suite green.
+2. Convert at least one known-good .3mf and one known-bad .3mf; verify outputs.
+3. `/ecc:quality-gate`.
+4. `/ecc:security-scan` — Flask + file upload + XML parsing = three classic vuln surfaces.

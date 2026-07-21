@@ -5,9 +5,22 @@ import re
 import json
 import uuid
 import time
+import math
+import traceback
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from flask import Flask, render_template, request, send_file, jsonify
 from history import HistoryManager
+
+
+class ConversionError(Exception):
+    """Raised for any recoverable failure during .3mf conversion.
+
+    convert_single_file catches this at its boundary and returns
+    (False, message) instead of letting the exception escape, but the
+    helpers raise loudly so failures are never silently swallowed.
+    """
+    pass
 
 app = Flask(__name__)
 
@@ -182,61 +195,335 @@ def parse_bambu_filaments(filepath):
                             'type': f_type
                         })
 
-    except Exception as e:
-        print(f"Error parsing filaments: {e}")
+    except zipfile.BadZipFile as e:
+        raise ConversionError(
+            f"Cannot read 3MF archive '{os.path.basename(filepath)}': {e}"
+        )
+    except (ET.ParseError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ConversionError(
+            f"Corrupt filament metadata in '{os.path.basename(filepath)}': {e}"
+        )
     return filaments
 
 
-# U1 bed dimensions
-U1_BED_SIZE = 230  # mm
-U1_BED_CENTER = U1_BED_SIZE / 2  # 115mm
+# ---------------------------------------------------------------------------
+# Bed geometry (derived from the selected U1 template, never hard-coded)
+# ---------------------------------------------------------------------------
+# 3MF core + production namespaces used in 3dmodel.model and submodels.
+CORE_NS = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
+PROD_NS = 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06'
+
+# Sentinel meaning "the main 3dmodel.model" when resolving component paths.
+_MAIN_MODEL = object()
+
+# If a build item resolves to no geometry at all we can still keep it in the
+# group layout, but we cannot drop it to the bed. Warned, not fatal (unless
+# NO item anywhere has geometry).
+_Z_DROP_EPS = 1e-6
 
 
-def recenter_model_transform(transform_str):
+@dataclass(frozen=True)
+class BedBounds:
+    """Printable-area bounds parsed from a template's printable_area polygon."""
+    min_x: float
+    max_x: float
+    min_y: float
+    max_y: float
+
+    @property
+    def center_x(self):
+        return (self.min_x + self.max_x) / 2.0
+
+    @property
+    def center_y(self):
+        return (self.min_y + self.max_y) / 2.0
+
+    @property
+    def width(self):
+        return self.max_x - self.min_x
+
+    @property
+    def height(self):
+        return self.max_y - self.min_y
+
+
+def parse_printable_area(project_settings):
     """
-    Parse a 3x4 transform matrix string and re-center X,Y to U1 bed center.
-    Transform format: "m00 m01 m02 m10 m11 m12 m20 m21 m22 tx ty tz"
-    Returns the modified transform string.
+    Parse the ``printable_area`` polygon from a project_settings dict into
+    independent X/Y bounds. The polygon is a list of "XxY" strings, e.g.
+    ['0.5x1', '270.5x1', '270.5x271', '0.5x271'].
+
+    Raises ConversionError if the key is missing or malformed.
     """
+    poly = project_settings.get('printable_area')
+    if not poly:
+        raise ConversionError(
+            "Template project_settings.config is missing 'printable_area'; "
+            "cannot determine U1 bed bounds."
+        )
+    xs, ys = [], []
+    for pt in poly:
+        try:
+            sx, sy = str(pt).split('x')
+            xs.append(float(sx))
+            ys.append(float(sy))
+        except (ValueError, AttributeError):
+            raise ConversionError(
+                f"Malformed printable_area point '{pt}' in template "
+                f"(expected 'XxY')."
+            )
+    return BedBounds(min(xs), max(xs), min(ys), max(ys))
+
+
+def _parse_transform(transform_str, label):
+    """
+    Parse a 12-value 3MF transform string into (A, t) where A is the 9-value
+    row-major 3x3 linear part and t is [tx, ty, tz]. A point maps as
+    p' = p . A + t (row-vector convention).
+
+    A missing/None transform is the 3MF identity. Any other malformation
+    (wrong count, non-numeric token) raises ConversionError naming the
+    offending object and token.
+    """
+    if transform_str is None:
+        return ([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0])
     parts = transform_str.split()
     if len(parts) != 12:
-        return transform_str  # Don't modify if unexpected format
+        raise ConversionError(
+            f"Transform for {label} has {len(parts)} values (expected 12): "
+            f"'{transform_str}'"
+        )
+    values = []
+    for tok in parts:
+        try:
+            values.append(float(tok))
+        except ValueError:
+            raise ConversionError(
+                f"Transform for {label} contains non-numeric token '{tok}' "
+                f"in '{transform_str}'"
+            )
+    return (values[0:9], values[9:12])
 
+
+def _apply(A, t, p):
+    """Apply p' = p . A + t (row-vector, A row-major 3x3)."""
+    x, y, z = p
+    return (
+        x * A[0] + y * A[3] + z * A[6] + t[0],
+        x * A[1] + y * A[4] + z * A[7] + t[1],
+        x * A[2] + y * A[5] + z * A[8] + t[2],
+    )
+
+
+def _matmul3(A, B):
+    """Row-major 3x3 multiply so that (p.A).B == p.(A.B)."""
+    R = [0.0] * 9
+    for i in range(3):
+        for j in range(3):
+            R[i * 3 + j] = (
+                A[i * 3 + 0] * B[0 * 3 + j]
+                + A[i * 3 + 1] * B[1 * 3 + j]
+                + A[i * 3 + 2] * B[2 * 3 + j]
+            )
+    return R
+
+
+def _object_map(root):
+    """Return {object_id: <object> element} for a parsed model/submodel root."""
+    cache = getattr(root, '_u1_object_map', None)
+    if cache is not None:
+        return cache
+    cache = {}
+    for obj in root.iter(f'{{{CORE_NS}}}object'):
+        oid = obj.get('id')
+        if oid is not None:
+            cache[oid] = obj
     try:
-        # Parse the 3x4 matrix
-        # First 9 values are the 3x3 rotation/scale matrix
-        # Last 3 values are translation (tx, ty, tz)
-        values = [float(p) for p in parts]
-
-        # Set X,Y to U1 bed center, keep Z as-is
-        values[9] = U1_BED_CENTER   # tx = 115
-        values[10] = U1_BED_CENTER  # ty = 115
-        # values[11] stays as-is (tz)
-
-        return ' '.join(str(v) for v in values)
-    except (ValueError, IndexError):
-        return transform_str  # Return original if parsing fails
+        root._u1_object_map = cache
+    except AttributeError:
+        pass
+    return cache
 
 
-def fix_part_matrix_z_offset(matrix_str):
+def _object_local_aabb(obj_elem):
     """
-    Parse a 4x4 matrix string and remove any Z offset.
-    Matrix format: "m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 m30 m31 m32 m33"
-    The Z offset is typically at position m23 (index 11).
-    Returns the modified matrix string.
+    Local axis-aligned bounding box of an object's own mesh, as
+    (minx, miny, minz, maxx, maxy, maxz), or None if it has no vertices.
     """
-    parts = matrix_str.split()
-    if len(parts) != 16:
-        return matrix_str  # Don't modify if unexpected format
+    mesh = obj_elem.find(f'{{{CORE_NS}}}mesh')
+    if mesh is None:
+        return None
+    verts = mesh.find(f'{{{CORE_NS}}}vertices')
+    if verts is None:
+        return None
+    minx = miny = minz = math.inf
+    maxx = maxy = maxz = -math.inf
+    found = False
+    for v in verts.findall(f'{{{CORE_NS}}}vertex'):
+        try:
+            x = float(v.get('x'))
+            y = float(v.get('y'))
+            z = float(v.get('z'))
+        except (TypeError, ValueError):
+            continue
+        found = True
+        minx, maxx = min(minx, x), max(maxx, x)
+        miny, maxy = min(miny, y), max(maxy, y)
+        minz, maxz = min(minz, z), max(maxz, z)
+    if not found:
+        return None
+    return (minx, miny, minz, maxx, maxy, maxz)
 
-    try:
-        values = [float(p) for p in parts]
-        # Position 11 is m23 (Z translation in 4x4 matrix)
-        # Set it to 0 to remove Z offset
-        values[11] = 0.0
-        return ' '.join(str(int(v) if v == int(v) else v) for v in values)
-    except (ValueError, IndexError):
-        return matrix_str
+
+def _collect_global_corners(file_path, object_id, A, t, get_root, corners, depth=0):
+    """
+    Recursively accumulate global-space AABB corners for an object.
+
+    (A, t) maps this object's local coordinates to global. Components are
+    resolved through their own transform and referenced submodel file.
+    """
+    if depth > 64:
+        raise ConversionError(
+            f"Component nesting exceeded depth 64 (objectid={object_id}); "
+            f"aborting to avoid a cycle."
+        )
+    root = get_root(file_path)
+    if root is None:
+        return  # missing submodel file -> contributes no geometry
+    obj = _object_map(root).get(str(object_id))
+    if obj is None:
+        return
+
+    aabb = _object_local_aabb(obj)
+    if aabb is not None:
+        minx, miny, minz, maxx, maxy, maxz = aabb
+        for cx in (minx, maxx):
+            for cy in (miny, maxy):
+                for cz in (minz, maxz):
+                    corners.append(_apply(A, t, (cx, cy, cz)))
+
+    comps = obj.find(f'{{{CORE_NS}}}components')
+    if comps is not None:
+        for comp in comps.findall(f'{{{CORE_NS}}}component'):
+            cobjid = comp.get('objectid')
+            cpath = comp.get(f'{{{PROD_NS}}}path') or file_path
+            cA, cT = _parse_transform(
+                comp.get('transform'), f"component objectid={cobjid}"
+            )
+            # submodel-local -> object coords via (cA, cT); then -> global via (A, t)
+            newA = _matmul3(cA, A)
+            newT = list(_apply(A, t, cT))
+            _collect_global_corners(
+                cpath, cobjid, newA, newT, get_root, corners, depth + 1
+            )
+
+
+def _collect_build_items(model_root):
+    """
+    Return the de-duplicated list of <item> elements under the build section,
+    matching both namespaced and non-namespaced findall passes (some files
+    omit the namespace). De-dup is by element identity so a single delta is
+    applied exactly once per item.
+    """
+    seen = set()
+    items = []
+    for finder in (
+        lambda: model_root.findall(f'.//{{{CORE_NS}}}item'),
+        lambda: model_root.findall('.//item'),
+    ):
+        for item in finder():
+            if id(item) not in seen:
+                seen.add(id(item))
+                items.append(item)
+    return items
+
+
+def _fmt_transform(A, t):
+    return ' '.join(repr(v) for v in (list(A) + list(t)))
+
+
+def recenter_and_drop_model(model_root, get_submodel_root, bed):
+    """
+    Rigidly translate the whole build as a group so its mesh-derived XY
+    bounding box is centered on the bed, and drop each item to the bed by its
+    own world-space minimum Z. Relative layout and every item's rotation/scale
+    (A) and inter-item offsets are preserved.
+
+    - model_root: parsed root of 3dmodel.model (mutated in place).
+    - get_submodel_root: callable(path)->root or None for component submodels.
+    - bed: BedBounds (target center + fit check).
+
+    Raises ConversionError on: no build items, no resolvable geometry anywhere,
+    malformed transforms, or a group that cannot fit the printable area.
+    """
+    def get_root(path):
+        if path is _MAIN_MODEL:
+            return model_root
+        return get_submodel_root(path)
+
+    items = _collect_build_items(model_root)
+    if not items:
+        raise ConversionError("3dmodel.model has no build <item>; nothing to place.")
+
+    resolved = []  # (item_elem, A, t, world_minz_or_None)
+    g_minx = g_miny = math.inf
+    g_maxx = g_maxy = -math.inf
+    any_geom = False
+
+    for item in items:
+        objid = item.get('objectid')
+        A, t = _parse_transform(item.get('transform'), f"build item objectid={objid}")
+        corners = []
+        _collect_global_corners(_MAIN_MODEL, objid, A, t, get_root, corners)
+        if corners:
+            xs = [c[0] for c in corners]
+            ys = [c[1] for c in corners]
+            zs = [c[2] for c in corners]
+            imnx, imxx = min(xs), max(xs)
+            imny, imxy = min(ys), max(ys)
+            imnz = min(zs)
+            g_minx, g_maxx = min(g_minx, imnx), max(g_maxx, imxx)
+            g_miny, g_maxy = min(g_miny, imny), max(g_maxy, imxy)
+            any_geom = True
+            resolved.append((item, A, t, imnz))
+        else:
+            print(
+                f"WARN: build item objectid={objid} has no resolvable geometry; "
+                f"applying group shift but skipping drop-to-bed."
+            )
+            resolved.append((item, A, t, None))
+
+    if not any_geom:
+        raise ConversionError(
+            "No build item has resolvable geometry; cannot recenter the model."
+        )
+
+    group_w = g_maxx - g_minx
+    group_h = g_maxy - g_miny
+    if group_w > bed.width + _Z_DROP_EPS or group_h > bed.height + _Z_DROP_EPS:
+        raise ConversionError(
+            f"Model spans {group_w:.1f}mm x {group_h:.1f}mm but the U1 printable "
+            f"area is only {bed.width:.1f}mm x {bed.height:.1f}mm; it will not fit. "
+            f"Re-export a single plate that fits the bed."
+        )
+
+    group_cx = (g_minx + g_maxx) / 2.0
+    group_cy = (g_miny + g_maxy) / 2.0
+    dx = bed.center_x - group_cx
+    dy = bed.center_y - group_cy
+
+    for item, A, t, world_minz in resolved:
+        tx = t[0] + dx
+        ty = t[1] + dy
+        tz = t[2]
+        if world_minz is not None and abs(world_minz) > _Z_DROP_EPS:
+            tz = t[2] - world_minz
+        item.set('transform', _fmt_transform(A, [tx, ty, tz]))
+
+
+def count_plates(model_settings_root):
+    """Number of <plate> blocks in a parsed model_settings.config root."""
+    return len(model_settings_root.findall('.//plate'))
 
 
 def convert_single_file(input_path, output_path, user_colors):
@@ -251,15 +538,35 @@ def convert_single_file(input_path, output_path, user_colors):
     Returns:
         (success, error_message) - Tuple with success bool and error string if failed
     """
-    # 1. Copy the original file to start
-    shutil.copy(input_path, output_path)
+    src_name = os.path.basename(input_path)
 
-    # 2. Read original file's project settings first to determine template
+    # 1. Read original file's project settings first to determine template
     try:
         with zipfile.ZipFile(input_path, 'r') as z_orig:
             original_project_settings = json.loads(z_orig.read('Metadata/project_settings.config').decode('utf-8'))
     except Exception as e:
         return (False, f'Could not read original project settings: {e}')
+
+    # 2. Multi-plate policy: the U1 prints a single plate. Refuse (loudly) any
+    #    file that carries more than one plate rather than silently collapsing
+    #    or mis-placing objects. Per-plate splitting is a planned follow-up.
+    try:
+        with zipfile.ZipFile(input_path, 'r') as z_orig:
+            if 'Metadata/model_settings.config' in z_orig.namelist():
+                ms_root = ET.fromstring(
+                    z_orig.read('Metadata/model_settings.config').decode('utf-8')
+                )
+                plate_count = count_plates(ms_root)
+                if plate_count > 1:
+                    return (
+                        False,
+                        f"{src_name} contains {plate_count} plates; the U1 prints "
+                        f"one plate — re-export a single plate",
+                    )
+    except ConversionError:
+        raise
+    except Exception as e:
+        return (False, f'Could not read model settings: {e}')
 
     # Determine which template to use based on support settings
     different_settings = original_project_settings.get('different_settings_to_system', [])
@@ -269,14 +576,20 @@ def convert_single_file(input_path, output_path, user_colors):
     else:
         template_file = 'u1_template.3mf'
 
-    # 3. Read U1 Template's project settings
+    # 3. Read U1 Template's project settings and derive bed bounds from it.
     try:
         with zipfile.ZipFile(template_file, 'r') as z_templ:
             u1_project_settings_json = json.loads(z_templ.read('Metadata/project_settings.config').decode('utf-8'))
     except Exception as e:
         return (False, f'U1 Template ({template_file}) not found on server: {e}')
 
-    # 4. Process the 3MF archive
+    try:
+        bed = parse_printable_area(u1_project_settings_json)
+    except ConversionError as e:
+        return (False, str(e))
+
+    # 4. Copy the original file, then process the 3MF archive.
+    shutil.copy(input_path, output_path)
     temp_zip = output_path + ".temp"
 
     try:
@@ -314,26 +627,33 @@ def convert_single_file(input_path, output_path, user_colors):
                 id_mapping = {}
                 new_id_counter = 1  # U1/Orca uses 1-based IDs for extruders
 
-                # We iterate through the original list to preserve order
+                # Build the mapping from the filaments the user actually kept,
+                # in original order. This MUST NOT depend on slice_info.config
+                # carrying <filament> nodes: many Bambu exports leave slice_info
+                # empty and describe filaments only in project_settings.config.
+                # Tying the mapping to a slice_info node lookup previously left
+                # id_mapping empty for those files, so painted-region extruder
+                # references were never remapped. When the original ids were
+                # already 1..N that was harmless by accident, but a deselected
+                # or non-sequential filament silently pointed painted regions at
+                # the wrong (padded white) extruder — losing the multi-color.
                 for original_fil in original_filaments:
                     original_id = original_fil['id']
                     if original_id in user_colors:
-                        # Find the corresponding node in the XML
+                        new_conf = user_colors[original_id]
+
+                        # Store the mapping (old Bambu id -> sequential U1 id).
+                        id_mapping[original_id] = str(new_id_counter)
+
+                        # Rewrite the slice_info <filament> node when present;
+                        # its absence must not break the mapping above.
                         node_to_update = filaments_parent.find(f".//filament[@id='{original_id}']")
                         if node_to_update is not None:
-                            new_conf = user_colors[original_id]
-
-                            # Store the mapping before changing
-                            id_mapping[original_id] = str(new_id_counter)
-
-                            # Re-map ID to be sequential (1-based)
                             node_to_update.set('id', str(new_id_counter))
-
-                            # Update color and type
                             node_to_update.set('color', new_conf['color'])
                             node_to_update.set('type', new_conf['type'])
 
-                            new_id_counter += 1
+                        new_id_counter += 1
 
                 # Add dummy filaments to reach 4 (white PLA)
                 TARGET_FILAMENTS = 4
@@ -354,54 +674,76 @@ def convert_single_file(input_path, output_path, user_colors):
                 model_settings_content = zin.read('Metadata/model_settings.config')
                 model_root = ET.fromstring(model_settings_content.decode('utf-8'))
 
-                # Find all extruder metadata tags and update them
+                # Find all extruder metadata tags and update them. Every
+                # painted-region extruder reference MUST remap to a kept
+                # filament; an unmapped reference would silently point at a
+                # non-existent extruder and corrupt the multi-color output.
                 for metadata in model_root.findall('.//metadata[@key="extruder"]'):
                     old_extruder = metadata.get('value')
                     if old_extruder in id_mapping:
                         metadata.set('value', id_mapping[old_extruder])
+                    else:
+                        raise ConversionError(
+                            f"model_settings.config references extruder "
+                            f"'{old_extruder}' which has no filament mapping "
+                            f"(mapped ids: {sorted(id_mapping.keys())}). The "
+                            f"selected filaments do not cover every painted "
+                            f"region."
+                        )
 
-                # Fix Z offset in part matrices (drop to bed)
-                for metadata in model_root.findall('.//metadata[@key="matrix"]'):
-                    old_matrix = metadata.get('value')
-                    if old_matrix:
-                        metadata.set('value', fix_part_matrix_z_offset(old_matrix))
+                # NOTE: drop-to-bed is handled per build item in
+                # recenter_and_drop_model (world-min-z), NOT by blanket-zeroing
+                # every part matrix — that destroyed intentional relative Z
+                # between parts (e.g. a button sitting on top of a body).
 
                 modified_model_settings = ET.tostring(model_root, encoding='utf-8', xml_declaration=True)
                 # --- End Model Settings Modification ---
 
                 # --- Start 3D Model Transform Modification (Auto-center) ---
-                # Re-center model X,Y to U1 bed center (115, 115)
-                model_3d_content = None
+                # Rigidly translate the whole build as a group onto the U1 bed
+                # center and drop each item to the bed by its own world-min-Z.
                 modified_3d_model = None
-                if '3D/3dmodel.model' in zin.namelist():
-                    model_3d_content = zin.read('3D/3dmodel.model').decode('utf-8')
-                    # Parse with namespace handling
-                    # Register namespaces to preserve them in output
-                    namespaces = {
-                        '': 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02',
-                        'p': 'http://schemas.microsoft.com/3dmanufacturing/production/2015/06',
-                        'BambuStudio': 'http://schemas.bambulab.com/package/2021'
-                    }
-                    for prefix, uri in namespaces.items():
-                        ET.register_namespace(prefix, uri)
+                if '3D/3dmodel.model' not in zin.namelist():
+                    raise ConversionError(
+                        f"{src_name} has no 3D/3dmodel.model; not a valid 3MF."
+                    )
 
-                    model_3d_root = ET.fromstring(model_3d_content)
+                # Register namespaces so they are preserved in output.
+                namespaces = {
+                    '': CORE_NS,
+                    'p': PROD_NS,
+                    'BambuStudio': 'http://schemas.bambulab.com/package/2021',
+                }
+                for prefix, uri in namespaces.items():
+                    ET.register_namespace(prefix, uri)
 
-                    # Find all item elements in the build section and update transforms
-                    # Need to use namespace-aware search
-                    ns = {'m': 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02'}
-                    for item in model_3d_root.findall('.//m:item', ns):
-                        transform = item.get('transform')
-                        if transform:
-                            item.set('transform', recenter_model_transform(transform))
+                model_3d_root = ET.fromstring(
+                    zin.read('3D/3dmodel.model').decode('utf-8')
+                )
 
-                    # Also check without namespace (some files may not use it)
-                    for item in model_3d_root.findall('.//item'):
-                        transform = item.get('transform')
-                        if transform:
-                            item.set('transform', recenter_model_transform(transform))
+                # Cache parsed submodel roots read from the input archive.
+                _submodel_cache = {}
 
-                    modified_3d_model = ET.tostring(model_3d_root, encoding='utf-8', xml_declaration=True)
+                def _read_submodel(path):
+                    name = str(path).lstrip('/')
+                    if name in _submodel_cache:
+                        return _submodel_cache[name]
+                    root = None
+                    if name in zin.namelist():
+                        try:
+                            root = ET.fromstring(zin.read(name).decode('utf-8'))
+                        except ET.ParseError as e:
+                            raise ConversionError(
+                                f"Corrupt submodel '{name}': {e}"
+                            )
+                    _submodel_cache[name] = root
+                    return root
+
+                recenter_and_drop_model(model_3d_root, _read_submodel, bed)
+
+                modified_3d_model = ET.tostring(
+                    model_3d_root, encoding='utf-8', xml_declaration=True
+                )
                 # --- End 3D Model Transform Modification ---
 
                 # --- Start Project Settings Modification ---
@@ -498,9 +840,21 @@ def convert_single_file(input_path, output_path, user_colors):
         shutil.move(temp_zip, output_path)
         return (True, None)
 
-    except Exception as e:
+    except ConversionError as e:
+        # Expected, actionable failure: surface the message, still log context.
         if os.path.exists(temp_zip):
             os.remove(temp_zip)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        traceback.print_exc()
+        return (False, str(e))
+    except Exception as e:
+        # Unexpected failure: log full traceback so it is never swallowed.
+        if os.path.exists(temp_zip):
+            os.remove(temp_zip)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        traceback.print_exc()
         return (False, str(e))
 
 
