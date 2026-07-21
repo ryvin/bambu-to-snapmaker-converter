@@ -135,7 +135,8 @@ def _submodel_xml(object_id, aabb):
     )
 
 
-def make_single_plate_3mf(path, plates=1, empty_slice_info=False):
+def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
+                          printer="Bambu Lab X1 Carbon"):
     """
     Build a minimal valid single-plate Bambu-style .3mf that uses
     components -> submodels (like real BambuStudio output). Two objects:
@@ -220,7 +221,8 @@ def make_single_plate_3mf(path, plates=1, empty_slice_info=False):
 
     project_settings = json.dumps(
         {
-            "printer_model": "Bambu Lab X1 Carbon",
+            "printer_model": printer,
+            "printer_settings_id": printer,
             "different_settings_to_system": [],
             "filament_colour": ["#FF0000", "#00FF00"],
             "filament_type": ["PLA", "PLA"],
@@ -505,7 +507,7 @@ def test_refix_preserves_all_configs_and_recenters(tmp_path):
 
     src = str(tmp_path / "keepcolors.3mf")
     out = str(tmp_path / "keepcolors_fixed.3mf")
-    make_single_plate_3mf(src, plates=1)
+    make_single_plate_3mf(src, plates=1, printer="Snapmaker U1 (0.4 nozzle)")
 
     ok, err = refix_geometry_only(src, out)
     assert ok, err
@@ -548,6 +550,24 @@ def test_refix_refuses_multiplate(tmp_path):
     ok, err = refix_geometry_only(src, out)
     assert ok is False
     assert "3" in err and "plate" in err.lower()
+    assert not os.path.exists(out)
+
+
+# ===========================================================================
+# Test: refix refuses a file still on a Bambu profile (needs full re-convert).
+# Geometry-only re-fix cannot swap the printer profile, so a mis-converted file
+# must not be handed back looking "fixed".
+# ===========================================================================
+def test_refix_refuses_non_u1_profile(tmp_path):
+    from refix import refix_geometry_only
+
+    src = str(tmp_path / "still_bambu.3mf")
+    out = str(tmp_path / "still_bambu_fixed.3mf")
+    make_single_plate_3mf(src, plates=1, printer="Bambu Lab A1 0.2 nozzle")
+
+    ok, err = refix_geometry_only(src, out)
+    assert ok is False
+    assert "not a Snapmaker U1" in err
     assert not os.path.exists(out)
 
 

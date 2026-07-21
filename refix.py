@@ -70,24 +70,35 @@ def refix_geometry_only(input_path, output_path, template_file=DEFAULT_TEMPLATE)
                         f"one plate — re-export a single plate",
                     )
 
-            # Bed bounds: prefer the file's own printable_area, else the template.
-            bed = None
+            # This tool only RE-PLACES a genuine U1 conversion. A file still on a
+            # Bambu (or other) printer profile needs FULL re-conversion to swap
+            # the profile, which geometry-only refix cannot do — refuse it so we
+            # never hand back a mis-profiled file that looks "fixed".
+            ps = {}
             if 'Metadata/project_settings.config' in names:
                 try:
                     ps = json.loads(
                         zin.read('Metadata/project_settings.config').decode('utf-8')
                     )
-                    if ps.get('printable_area'):
-                        bed = parse_printable_area(ps)
-                except (json.JSONDecodeError, ConversionError):
-                    bed = None
-            if bed is None:
-                with zipfile.ZipFile(template_file, 'r') as zt:
-                    bed = parse_printable_area(
-                        json.loads(
-                            zt.read('Metadata/project_settings.config').decode('utf-8')
-                        )
+                except json.JSONDecodeError:
+                    ps = {}
+            profile = str(ps.get('printer_settings_id') or ps.get('printer_model') or '')
+            if 'U1' not in profile and 'Snapmaker' not in profile:
+                return (
+                    False,
+                    f"{src_name} is not a Snapmaker U1 conversion (printer profile "
+                    f"'{profile or 'unknown'}'); re-convert it through the app to swap "
+                    f"the profile — colors are preserved.",
+                )
+
+            # Always target the authoritative U1 bed from the template, never the
+            # file's own printable_area (a mis-set bed would place the model wrong).
+            with zipfile.ZipFile(template_file, 'r') as zt:
+                bed = parse_printable_area(
+                    json.loads(
+                        zt.read('Metadata/project_settings.config').decode('utf-8')
                     )
+                )
 
             # Preserve namespaces on output.
             for prefix, uri in {'': CORE_NS, 'p': PROD_NS, 'BambuStudio': BAMBU_NS}.items():
@@ -153,14 +164,23 @@ def main(argv=None):
     ap.add_argument('paths', nargs='+', help="Files or directories of .3mf to re-fix.")
     ap.add_argument('--inplace', action='store_true',
                     help="Overwrite the original (keeps a one-time <name>.bak).")
+    ap.add_argument('--outdir', default=None,
+                    help="Write fixed files (same basename) into this directory; "
+                         "originals untouched. Overrides --suffix/--inplace.")
     ap.add_argument('--suffix', default='_fixed',
-                    help="Output suffix when not --inplace (default: _fixed).")
+                    help="Output suffix when not --inplace/--outdir (default: _fixed).")
     args = ap.parse_args(argv)
+
+    if args.outdir:
+        os.makedirs(args.outdir, exist_ok=True)
 
     ok_n = fail_n = 0
     for src in _iter_targets(args.paths):
         stem, ext = os.path.splitext(src)
-        if args.inplace:
+        if args.outdir:
+            out = os.path.join(args.outdir, os.path.basename(src))
+            success, err = refix_geometry_only(src, out)
+        elif args.inplace:
             out = src
             bak = src + '.bak'
             if not os.path.exists(bak):
@@ -175,10 +195,10 @@ def main(argv=None):
 
         if success:
             ok_n += 1
-            print(f"OK   {os.path.basename(src)} -> {os.path.basename(out)}")
+            print(f"OK   {os.path.basename(src)} -> {out}", flush=True)
         else:
             fail_n += 1
-            print(f"SKIP {os.path.basename(src)}: {err}")
+            print(f"SKIP {os.path.basename(src)}: {err}", flush=True)
 
     print(f"\n{ok_n} fixed, {fail_n} skipped.")
     return 0 if fail_n == 0 else 1
