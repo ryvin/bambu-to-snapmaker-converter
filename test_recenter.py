@@ -493,3 +493,59 @@ def test_uncovered_painted_region_raises(tmp_path):
     ok, err = convert_single_file(src, out, colors)
     assert ok is False
     assert "2" in err and "extruder" in err.lower()
+
+
+# ===========================================================================
+# Test 13: geometry-only re-fix keeps every non-model entry byte-identical
+# (colors/painting untouched) while recentering the model on the bed.
+# ===========================================================================
+def test_refix_preserves_all_configs_and_recenters(tmp_path):
+    import hashlib
+    from refix import refix_geometry_only
+
+    src = str(tmp_path / "keepcolors.3mf")
+    out = str(tmp_path / "keepcolors_fixed.3mf")
+    make_single_plate_3mf(src, plates=1)
+
+    ok, err = refix_geometry_only(src, out)
+    assert ok, err
+
+    def entry_hashes(path):
+        with zipfile.ZipFile(path) as z:
+            return {n: hashlib.md5(z.read(n)).hexdigest() for n in z.namelist()}
+
+    before, after = entry_hashes(src), entry_hashes(out)
+    # Same set of entries; ONLY the 3D model changed.
+    assert set(before) == set(after)
+    changed = [n for n in before if before[n] != after[n]]
+    assert changed == ["3D/3dmodel.model"]
+
+    # Colors/types config is byte-for-byte identical.
+    with zipfile.ZipFile(src) as z:
+        ps_before = z.read("Metadata/project_settings.config")
+    with zipfile.ZipFile(out) as z:
+        ps_after = z.read("Metadata/project_settings.config")
+    assert ps_before == ps_after
+
+    # Model is now centered on the (template-derived) bed and dropped to z=0.
+    gminx, gminy, gmaxx, gmaxy, item_minz = group_bbox_of_3mf(out)
+    assert (gminx + gmaxx) / 2 == pytest.approx(BED_CX, abs=1e-6)
+    assert (gminy + gmaxy) / 2 == pytest.approx(BED_CY, abs=1e-6)
+    for mz in item_minz:
+        assert mz == pytest.approx(0.0, abs=1e-6)
+
+
+# ===========================================================================
+# Test 14: geometry-only re-fix refuses multi-plate (same policy)
+# ===========================================================================
+def test_refix_refuses_multiplate(tmp_path):
+    from refix import refix_geometry_only
+
+    src = str(tmp_path / "multi.3mf")
+    out = str(tmp_path / "multi_fixed.3mf")
+    make_single_plate_3mf(src, plates=3)
+
+    ok, err = refix_geometry_only(src, out)
+    assert ok is False
+    assert "3" in err and "plate" in err.lower()
+    assert not os.path.exists(out)

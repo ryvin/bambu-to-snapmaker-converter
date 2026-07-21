@@ -67,6 +67,11 @@ python app.py
 - **Per-item drop-to-bed**: each item's Z translation is reduced by its own world-space minimum Z, so each part sits on the bed **without** flattening intentional relative Z between parts (the old blanket zeroing of every part matrix's `m23` destroyed that).
 - **Fail-loud**: raises `ConversionError` on malformed transforms (naming the object + offending token), no resolvable geometry, or a group that cannot fit the printable area. Helpers raise; `convert_single_file` catches at its boundary → `(False, message)` + logged traceback.
 
+### Geometry-Only Re-fix (`refix.py`)
+- **Purpose**: re-apply ONLY the bed placement (group recenter + drop-to-bed) to a `.3mf`, copying every other archive entry byte-for-byte. Filament colors/types/painting and all metadata are preserved exactly — no filament UI, no id remapping. Fixes an already-converted U1 file that sits off-bed **without** redoing custom ("full spectrum") colors.
+- **`refix_geometry_only(input_path, output_path, template_file)`**: reuses `recenter_and_drop_model` / `parse_printable_area` (no duplicated logic); rewrites only `3D/3dmodel.model`; refuses multi-plate. Bed bounds from the file's own `printable_area` if present, else the template.
+- **CLI**: `python refix.py FILE_OR_DIR [...] [--inplace] [--suffix _fixed]` — default writes `<name>_fixed.3mf`; `--inplace` overwrites after a one-time `<name>.bak`.
+
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)
 - **`auto_map_filaments(filaments)`**: Automatically maps filament types to closest U1 profiles (PLA→PLA, PETG→PETG-HF, etc.)
