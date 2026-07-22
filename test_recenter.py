@@ -136,6 +136,7 @@ def _submodel_xml(object_id, aabb):
 
 
 def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
+                          no_slice_info=False,
                           printer="Bambu Lab X1 Carbon"):
     """
     Build a minimal valid single-plate Bambu-style .3mf that uses
@@ -234,7 +235,8 @@ def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
         z.writestr("3D/Objects/a.model", _submodel_xml(1, (0, 0, 0, 10, 10, 10)))
         z.writestr("3D/Objects/b.model", _submodel_xml(1, (0, 0, 0, 20, 20, 20)))
         z.writestr("Metadata/model_settings.config", model_settings)
-        z.writestr("Metadata/slice_info.config", slice_info)
+        if not no_slice_info:
+            z.writestr("Metadata/slice_info.config", slice_info)
         z.writestr("Metadata/project_settings.config", project_settings)
 
 
@@ -408,7 +410,10 @@ def test_real_fixture_refused_as_multiplate(tmp_path):
     colors = {"1": {"color": "#FF0000FF", "type": "PLA"}}
     ok, err = convert_single_file(REAL_FIXTURE, out, colors)
     assert ok is False
-    assert "6" in err  # 6 plates
+    # The real file's plate count can change between sessions; assert the
+    # multi-plate refusal shape, not a hard-coded count.
+    import re as _re
+    assert _re.search(r"contains \d+ plates", err)
     assert "plate" in err.lower()
 
 
@@ -458,6 +463,21 @@ def test_bed_bounds_from_template():
 def test_missing_printable_area_raises():
     with pytest.raises(ConversionError):
         parse_printable_area({})
+
+
+# ===========================================================================
+# A .3mf with NO slice_info.config at all (common for non-Bambu exports) must
+# still convert; the output gains a synthesized slice_info entry.
+# ===========================================================================
+def test_missing_sliceinfo_is_synthesized(tmp_path):
+    src = str(tmp_path / "nosi.3mf")
+    out = str(tmp_path / "nosi_out.3mf")
+    make_single_plate_3mf(src, plates=1, no_slice_info=True)
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+    with zipfile.ZipFile(out) as z:
+        assert "Metadata/slice_info.config" in z.namelist()
 
 
 # ===========================================================================

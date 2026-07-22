@@ -631,8 +631,14 @@ def convert_single_file(input_path, output_path, user_colors):
     try:
         with zipfile.ZipFile(output_path, 'r') as zin:
             with zipfile.ZipFile(temp_zip, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-                # Get the original slice_info.config to modify it
-                slice_info_content = zin.read('Metadata/slice_info.config')
+                # Get the original slice_info.config to modify it. Many valid
+                # 3MFs omit it entirely — synthesize a minimal config instead
+                # of failing the whole conversion (filaments/colors live in
+                # project_settings.config, which is handled separately).
+                if 'Metadata/slice_info.config' in zin.namelist():
+                    slice_info_content = zin.read('Metadata/slice_info.config')
+                else:
+                    slice_info_content = b'<?xml version="1.0" encoding="UTF-8"?>\n<config/>'
 
                 # --- Start Slice Info Modification ---
                 # Change machine model
@@ -872,6 +878,11 @@ def convert_single_file(input_path, output_path, user_colors):
                         # Copy all other files as-is
                         content = zin.read(item.filename)
                         zout.writestr(item, content)
+
+                # If the source had no slice_info.config, add the synthesized
+                # (padded-filament) one so the output is a complete U1 project.
+                if 'Metadata/slice_info.config' not in zin.namelist():
+                    zout.writestr('Metadata/slice_info.config', modified_slice_info)
 
         shutil.move(temp_zip, output_path)
         return (True, None)
