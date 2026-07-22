@@ -48,7 +48,7 @@ python app.py
 
 ### Conversion Logic (in `convert_single_file()`)
 1. Reads original Bambu .3mf and extracts project settings
-2. **Refuses multi-plate files loudly**: counts `<plate>` blocks in `model_settings.config`; a file with >1 plate is rejected with a clear error (the U1 prints one plate). Per-plate splitting is a planned follow-up.
+2. **Refuses multi-plate files loudly**: counts `<plate>` blocks in `model_settings.config`; a file with >1 plate is rejected with a clear error (the U1 prints one plate). Use the per-plate splitter (`split_plates.py`, below) to turn such a file into N single-plate files first.
 3. Detects if supports were enabled via `different_settings_to_system` array
 4. Selects appropriate U1 template based on support detection
 5. **Derives bed bounds from the selected template** (`parse_printable_area`) — never hard-coded
@@ -72,6 +72,13 @@ python app.py
 - **`refix_geometry_only(input_path, output_path, template_file)`**: reuses `recenter_and_drop_model` / `parse_printable_area` (no duplicated logic); rewrites only `3D/3dmodel.model`; refuses multi-plate. Bed bounds from the file's own `printable_area` if present, else the template.
 - **CLI**: `python refix.py FILE_OR_DIR [...] [--inplace] [--suffix _fixed]` — default writes `<name>_fixed.3mf`; `--inplace` overwrites after a one-time `<name>.bak`.
 
+### Per-plate Split (`split_plates.py`)
+- **Purpose**: turn one multi-plate Bambu `.3mf` into N single-plate `.3mf` files (`<stem>_plate{k}.3mf`, k=1..N), each of which then converts normally via `convert_single_file`.
+- **`split_plates(input_path, output_dir=None) -> (ok, list[str] | msg)`**: imports helpers from `app` (`count_plates`, `_collect_build_items`, `CORE_NS`) — no duplicated logic. Per output only two entries are rewritten: `Metadata/model_settings.config` keeps ONLY that plate's `<plate>` block, its `<object>` config blocks, and its `assemble_item`s; `3D/3dmodel.model` build is filtered to only that plate's `<item>`s (resources untouched). **Every other archive entry is copied byte-for-byte** (colors/painting preserved).
+- **Plate membership**: each `<plate>` block's `<model_instance>` children carry `<metadata key="object_id">` values matching build `<item objectid>` (verified against real 7-plate BambuStudio output).
+- **Fail-loud**: single-plate input, a plate with no `model_instance` objects, or an object_id with no matching build item all return `(False, msg)` BEFORE any output is written (no partial output set). Note: `zipfile.writestr` mutates a passed `ZipInfo`; the splitter writes with copies so the input infolist survives multiple output passes.
+- **CLI**: `python split_plates.py FILE [--outdir DIR]` — default writes beside the input.
+
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)
 - **`auto_map_filaments(filaments)`**: Automatically maps filament types to closest U1 profiles (PLA→PLA, PETG→PETG-HF, etc.)
@@ -91,8 +98,11 @@ python3 -m pytest test_batch.py -v
 # Run History module tests (8 tests)
 python3 -m pytest test_history.py -v
 
-# Run recenter / bed-dims / drop-to-bed + fail-loud tests (15 tests, pure Python)
+# Run recenter / bed-dims / drop-to-bed + fail-loud tests (20 tests, pure Python)
 python3 -m pytest test_recenter.py -v
+
+# Run per-plate split tests (7 tests, pure Python)
+python3 -m pytest test_split.py -v
 
 # Run all tests
 python3 -m pytest -v
