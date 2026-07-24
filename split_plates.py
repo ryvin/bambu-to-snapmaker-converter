@@ -30,6 +30,7 @@ import argparse
 import copy
 import os
 import shutil
+import struct
 import sys
 import traceback
 import zipfile
@@ -45,6 +46,54 @@ from app import (
 )
 
 BAMBU_NS = 'http://schemas.bambulab.com/package/2021'
+
+_ZIP64_LIMIT = 0xFFFFFFFF
+
+
+def _copy_member_raw(zin, zout, info):
+    """
+    Copy one archive member from ``zin`` to ``zout`` WITHOUT re-deflating it.
+
+    A multi-plate file's mesh entries (often 100+ MB uncompressed) are identical
+    in every plate output, so decompressing and recompressing them once per plate
+    dominated the split time. Instead we transfer the member's already-compressed
+    bytes verbatim, regenerating a clean local header from the central-directory
+    ``ZipInfo`` (which carries the correct CRC/sizes) with the streaming
+    data-descriptor bit cleared.
+
+    Returns True on success, False if the member is not a candidate for raw copy
+    (encrypted, or large enough to need ZIP64) — the caller must then fall back to
+    the decompress+recompress path for that member.
+    """
+    if info.flag_bits & 0x01:                       # encrypted — cannot copy blind
+        return False
+    if (info.compress_size >= _ZIP64_LIMIT
+            or info.file_size >= _ZIP64_LIMIT
+            or zout.fp.tell() >= _ZIP64_LIMIT):      # ZIP64 territory — use safe path
+        return False
+
+    zin.fp.seek(info.header_offset)
+    local = zin.fp.read(30)
+    if local[:4] != b'PK\x03\x04':
+        raise zipfile.BadZipFile(
+            f"bad local header for '{info.filename}' at offset {info.header_offset}")
+    name_len, extra_len = struct.unpack('<HH', local[26:30])
+    zin.fp.seek(info.header_offset + 30 + name_len + extra_len)
+    raw = zin.fp.read(info.compress_size)
+    if len(raw) != info.compress_size:
+        raise zipfile.BadZipFile(
+            f"truncated member '{info.filename}': expected {info.compress_size} "
+            f"compressed bytes, read {len(raw)}")
+
+    zi = copy.copy(info)
+    zi.flag_bits &= ~0x08                            # sizes/CRC are known; no descriptor
+    zi.header_offset = zout.fp.tell()
+    zout.fp.write(zi.FileHeader(zip64=False))
+    zout.fp.write(raw)
+    zout.start_dir = zout.fp.tell()
+    zout.filelist.append(zi)
+    zout.NameToInfo[zi.filename] = zi
+    return True
 
 
 def _plate_object_ids(plate_elem):
@@ -176,7 +225,9 @@ def split_plates(input_path, output_dir=None):
                             zout.writestr(copy.copy(info), new_ms)
                         elif info.filename == '3D/3dmodel.model':
                             zout.writestr(copy.copy(info), new_model)
-                        else:
+                        elif not _copy_member_raw(zin, zout, info):
+                            # Unchanged member that can't be copied raw (encrypted
+                            # or ZIP64): fall back to decompress + recompress.
                             zout.writestr(copy.copy(info), zin.read(info.filename))
                 outputs.append(out_path)
 

@@ -29,10 +29,14 @@ from app import (
     _collect_build_items,
     _collect_global_corners,
     _parse_transform,
+    _index_from_dom,
+    _stream_geom_index,
+    make_zip_submodel_reader,
     _MAIN_MODEL,
     CORE_NS,
     PROD_NS,
 )
+import io
 
 REAL_FIXTURE = "/mnt/e/Downloads/ButterflyWing_fans_U1.3mf"
 
@@ -628,3 +632,98 @@ def test_geometry_resolves_without_core_namespace():
     assert (min(xs), max(xs)) == (0, 10)
     assert (min(ys), max(ys)) == (0, 20)
     assert (min(zs), max(zs)) == (0, 4)
+
+
+# --- Streaming geometry-index regression (perf refactor: parse the 100+ MB mesh
+#     once via iterparse instead of a full DOM + re-walks). The streaming index
+#     must be byte-for-byte equal to the DOM index it replaces. ---
+
+_PARITY_MODELS = [
+    # (label, xml) — namespaced + un-namespaced, meshes, components w/ p:path.
+    (
+        "namespaced-mesh-and-components",
+        f'<model xmlns="{CORE_NS}" xmlns:p="{PROD_NS}"><resources>'
+        f'<object id="1" type="model"><mesh><vertices>'
+        f'<vertex x="-3" y="1" z="0.5"/><vertex x="4" y="9" z="2"/>'
+        f'<vertex x="0" y="-2" z="-1"/></vertices>'
+        f'<triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>'
+        f'<object id="2" type="model"><components>'
+        f'<component objectid="1" transform="1 0 0 0 1 0 0 0 1 5 6 7" p:path="/3D/Objects/sub.model"/>'
+        f'</components></object>'
+        f'</resources><build><item objectid="2"/></build></model>',
+    ),
+    (
+        "no-core-namespace",
+        f'<model xmlns:p="{PROD_NS}"><resources>'
+        f'<object id="7"><mesh><vertices>'
+        f'<vertex x="0" y="0" z="0"/><vertex x="10" y="20" z="4"/>'
+        f'</vertices></mesh></object></resources></model>',
+    ),
+    (
+        "object-no-vertices-only-components",
+        f'<model xmlns="{CORE_NS}"><resources>'
+        f'<object id="5"><components>'
+        f'<component objectid="1" transform="2 0 0 0 2 0 0 0 2 0 0 0"/>'
+        f'</components></object></resources></model>',
+    ),
+    (
+        "bad-vertex-coord-skipped",
+        f'<model xmlns="{CORE_NS}"><resources>'
+        f'<object id="3"><mesh><vertices>'
+        f'<vertex x="1" y="2" z="3"/><vertex x="oops" y="2" z="3"/>'
+        f'<vertex x="5" y="1" z="9"/></vertices></mesh></object></resources></model>',
+    ),
+    (
+        "first-mesh-only",
+        f'<model xmlns="{CORE_NS}"><resources>'
+        f'<object id="4"><mesh><vertices><vertex x="0" y="0" z="0"/>'
+        f'<vertex x="1" y="1" z="1"/></vertices></mesh>'
+        f'<mesh><vertices><vertex x="99" y="99" z="99"/></vertices></mesh>'
+        f'</object></resources></model>',
+    ),
+]
+
+
+@pytest.mark.parametrize("label,xml", _PARITY_MODELS, ids=[m[0] for m in _PARITY_MODELS])
+def test_stream_index_matches_dom_index(label, xml):
+    dom = _index_from_dom(ET.fromstring(xml))
+    stream = _stream_geom_index(io.BytesIO(xml.encode("utf-8")))
+    assert stream.objects == dom.objects, f"stream/DOM index diverged for {label}"
+
+
+def test_stream_index_prune_stress(monkeypatch):
+    """Many vertices force repeated child-pruning; AABB must still match DOM."""
+    monkeypatch.setattr(app, "_PRUNE_EVERY", 3)  # force many prunes on a tiny input
+    verts = "".join(
+        f'<vertex x="{i}" y="{-i}" z="{i * 0.5}"/>' for i in range(50)
+    )
+    tris = "".join(f'<triangle v1="0" v2="1" v3="2"/>' for _ in range(50))
+    xml = (
+        f'<model xmlns="{CORE_NS}"><resources><object id="1"><mesh>'
+        f'<vertices>{verts}</vertices><triangles>{tris}</triangles>'
+        f'</mesh></object></resources></model>'
+    )
+    dom = _index_from_dom(ET.fromstring(xml))
+    stream = _stream_geom_index(io.BytesIO(xml.encode("utf-8")))
+    assert stream.objects == dom.objects
+    assert stream.objects["1"]["aabb"] == (0.0, -49.0, 0.0, 49.0, 0.0, 24.5)
+
+
+def test_zip_submodel_reader_corrupt_message(tmp_path):
+    p = tmp_path / "broken.3mf"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("3D/Objects/object_1.model", "<model><resources><object")  # truncated
+    with zipfile.ZipFile(p) as zin:
+        read = make_zip_submodel_reader(zin)
+        with pytest.raises(ConversionError) as ei:
+            read("/3D/Objects/object_1.model")
+    assert "Corrupt submodel '3D/Objects/object_1.model'" in str(ei.value)
+
+
+def test_zip_submodel_reader_missing_returns_none(tmp_path):
+    p = tmp_path / "empty.3mf"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("Metadata/x.config", "x")
+    with zipfile.ZipFile(p) as zin:
+        read = make_zip_submodel_reader(zin)
+        assert read("/3D/Objects/nope.model") is None

@@ -65,6 +65,7 @@ python app.py
 - **Bed bounds are parsed from the template's `printable_area` polygon** → bounds `[0.5, 270.5] × [1, 271]`, center **(135.5, 136.0)**. Independent X/Y always. (`U1_BED_SIZE`/`U1_BED_CENTER` constants were removed — they encoded a wrong 230/115 square bed that placed models off-bed and could crash the printer with "Move out of range".)
 - **Group recenter, not per-item**: computes the mesh-derived global XY bounding box over **all** build items (resolving `<component>` submodels through their transforms), then applies a **single rigid delta** so the group's bbox center lands on the bed center. Every item's rotation/scale and all inter-item offsets are preserved (multi-object layouts stay intact instead of collapsing onto one point).
 - **Per-item drop-to-bed**: each item's Z translation is reduced by its own world-space minimum Z, so each part sits on the bed **without** flattening intentional relative Z between parts (the old blanket zeroing of every part matrix's `m23` destroyed that).
+- **Streaming geometry index (perf)**: recenter only needs each object's local AABB + its `<component>` list, never triangles. Large mesh submodels (100+ MB, millions of `<triangle>`s) are read via `_stream_geom_index` (`ET.iterparse` + bounded-memory child pruning) into a `_GeomIndex` `{oid: {aabb, components}}` — parsed **once**, not built into a full DOM and re-walked. `make_zip_submodel_reader(zin)` is the shared submodel-reader factory (used by both `convert_single_file` and `refix.py`). `_collect_global_corners` consumes the index; `_as_geom_index` transparently accepts either a `_GeomIndex`, a parsed root (for the small main model + tests), or `None`. Cut a real 108 MB-mesh lithophane plate from ~45s → ~19s convert; DOM/stream index parity is asserted in `test_recenter.py`.
 - **Fail-loud**: raises `ConversionError` on malformed transforms (naming the object + offending token), no resolvable geometry, or a group that cannot fit the printable area. Helpers raise; `convert_single_file` catches at its boundary → `(False, message)` + logged traceback.
 
 ### Geometry-Only Re-fix (`refix.py`)
@@ -75,6 +76,7 @@ python app.py
 ### Per-plate Split (`split_plates.py`)
 - **Purpose**: turn one multi-plate Bambu `.3mf` into N single-plate `.3mf` files (`<stem>_plate{k}.3mf`, k=1..N), each of which then converts normally via `convert_single_file`.
 - **`split_plates(input_path, output_dir=None) -> (ok, list[str] | msg)`**: imports helpers from `app` (`count_plates`, `_collect_build_items`, `CORE_NS`) — no duplicated logic. Per output only two entries are rewritten: `Metadata/model_settings.config` keeps ONLY that plate's `<plate>` block, its `<object>` config blocks, and its `assemble_item`s; `3D/3dmodel.model` build is filtered to only that plate's `<item>`s (resources untouched). **Every other archive entry is copied byte-for-byte** (colors/painting preserved).
+- **Raw member copy (perf)**: unchanged entries are transferred via `_copy_member_raw` — the source's already-compressed bytes are written verbatim (regenerating a clean local header from the central-directory `ZipInfo`, streaming data-descriptor bit cleared), instead of decompress→re-deflate. The huge mesh is identical in every plate output, so this avoids re-deflating 100+ MB per plate; guards fall back to decompress+recompress for encrypted/ZIP64 members. Cut a 2-plate 108 MB-mesh split from ~22s → ~0.5s (verified `testzip` OK + members byte-identical).
 - **Plate membership**: each `<plate>` block's `<model_instance>` children carry `<metadata key="object_id">` values matching build `<item objectid>` (verified against real 7-plate BambuStudio output).
 - **Fail-loud**: single-plate input, a plate with no `model_instance` objects, or an object_id with no matching build item all return `(False, msg)` BEFORE any output is written (no partial output set). Note: `zipfile.writestr` mutates a passed `ZipInfo`; the splitter writes with copies so the input infolist survives multiple output passes.
 - **CLI**: `python split_plates.py FILE [--outdir DIR]` — default writes beside the input.
@@ -99,7 +101,7 @@ python3 -m pytest test_batch.py -v
 # Run History module tests (8 tests)
 python3 -m pytest test_history.py -v
 
-# Run recenter / bed-dims / drop-to-bed + fail-loud tests (20 tests, pure Python)
+# Run recenter / bed-dims / drop-to-bed + fail-loud + streaming-index tests (28 tests, pure Python)
 python3 -m pytest test_recenter.py -v
 
 # Run per-plate split tests (7 tests, pure Python)

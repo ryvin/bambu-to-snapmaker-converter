@@ -33,6 +33,7 @@ from app import (
     PROD_NS,
     parse_printable_area,
     recenter_and_drop_model,
+    make_zip_submodel_reader,
     count_plates,
 )
 
@@ -106,20 +107,9 @@ def refix_geometry_only(input_path, output_path, template_file=DEFAULT_TEMPLATE)
 
             model_root = ET.fromstring(zin.read('3D/3dmodel.model').decode('utf-8'))
 
-            _cache = {}
-
-            def _read_submodel(path):
-                name = str(path).lstrip('/')
-                if name in _cache:
-                    return _cache[name]
-                root = None
-                if name in names:
-                    try:
-                        root = ET.fromstring(zin.read(name).decode('utf-8'))
-                    except ET.ParseError as e:
-                        raise ConversionError(f"Corrupt submodel '{name}': {e}")
-                _cache[name] = root
-                return root
+            # Stream submodels once into geometry indexes (no full DOM of big
+            # meshes; they are copied byte-for-byte on output anyway).
+            _read_submodel = make_zip_submodel_reader(zin)
 
             recenter_and_drop_model(model_root, _read_submodel, bed)
             new_model = ET.tostring(

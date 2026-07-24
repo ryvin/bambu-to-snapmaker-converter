@@ -409,6 +409,194 @@ def _object_local_aabb(obj_elem):
     return (minx, miny, minz, maxx, maxy, maxz)
 
 
+class _GeomIndex:
+    """Per-model geometry index: everything recenter needs from a model file.
+
+    objects: {object_id: {'aabb': (minx,miny,minz,maxx,maxy,maxz) or None,
+                          'components': [(cobjid, transform_str, path_raw), ...]}}
+    transform_str/path_raw are RAW attribute values (possibly None); parsing and
+    the path fallback happen at consumption time in _collect_global_corners so
+    error timing/messages stay byte-identical to the DOM version.
+    """
+    __slots__ = ('objects',)
+
+    def __init__(self, objects):
+        self.objects = objects
+
+
+def _index_from_dom(root):
+    """Build a _GeomIndex from an already-parsed model/submodel Element.
+
+    Lifts, verbatim, the per-object reads _collect_global_corners historically
+    did on the DOM (first <components> child only; first <mesh>/<vertices> via
+    _object_local_aabb) so the DOM path stays equal by construction.
+    """
+    objects = {}
+    for oid, obj in _object_map(root).items():
+        comps_list = []
+        comps = _find_child(obj, 'components')
+        if comps is not None:
+            for comp in comps:
+                if _lname(comp.tag) != 'component':
+                    continue
+                comps_list.append((
+                    comp.get('objectid'),
+                    comp.get('transform'),
+                    _get_attr(comp, 'path'),
+                ))
+        objects[oid] = {'aabb': _object_local_aabb(obj), 'components': comps_list}
+    return _GeomIndex(objects)
+
+
+def _as_geom_index(node):
+    """Normalize get_root's return to a _GeomIndex: None->None, index->itself,
+    parsed Element->_index_from_dom (cached on the element, best-effort)."""
+    if node is None:
+        return None
+    if isinstance(node, _GeomIndex):
+        return node
+    cache = getattr(node, '_u1_geom_index', None)
+    if cache is not None:
+        return cache
+    idx = _index_from_dom(node)
+    try:
+        node._u1_geom_index = idx
+    except AttributeError:
+        pass
+    return idx
+
+
+# Leaf elements (<vertex>/<triangle>) between container prunes while streaming;
+# bounds transient element shells to a few MB regardless of input size.
+_PRUNE_EVERY = 20000
+
+
+class _ObjState:
+    __slots__ = ('elem', 'oid', 'mesh_elem', 'verts_elem', 'comps_elem',
+                 'components', 'found',
+                 'minx', 'miny', 'minz', 'maxx', 'maxy', 'maxz', 'aabb')
+
+
+def _stream_geom_index(fileobj):
+    """One streaming pass over a model/submodel XML: per-object local AABB plus
+    component list, with bounded memory. Namespace-agnostic (matches by local
+    name). Raises ET.ParseError on malformed XML (the caller wraps it).
+
+    Everything is read at 'start' events (attributes are complete there and we
+    never read children), so nothing we clear on 'end' is ever read afterward.
+    """
+    entries = []          # _ObjState in document (start) order; folded last-wins
+    stack = []            # open Element refs (pushed on start, popped on end)
+    obj_stack = []        # open _ObjState refs (innermost last)
+    leaf_count = 0
+
+    for event, elem in ET.iterparse(fileobj, events=('start', 'end')):
+        lname = _lname(elem.tag)
+
+        if event == 'start':
+            stack.append(elem)
+            if lname == 'object':
+                st = _ObjState()
+                st.elem = elem
+                st.oid = elem.get('id')
+                st.mesh_elem = st.verts_elem = st.comps_elem = None
+                st.components = []
+                st.found = False
+                st.minx = st.miny = st.minz = math.inf
+                st.maxx = st.maxy = st.maxz = -math.inf
+                st.aabb = None
+                obj_stack.append(st)
+                entries.append(st)
+            elif obj_stack:
+                st = obj_stack[-1]
+                parent = stack[-2] if len(stack) >= 2 else None
+                if lname == 'mesh':
+                    if parent is st.elem and st.mesh_elem is None:
+                        st.mesh_elem = elem
+                elif lname == 'vertices':
+                    if (st.mesh_elem is not None and parent is st.mesh_elem
+                            and st.verts_elem is None):
+                        st.verts_elem = elem
+                elif lname == 'vertex':
+                    if st.verts_elem is not None and parent is st.verts_elem:
+                        try:
+                            x = float(elem.get('x'))
+                            y = float(elem.get('y'))
+                            z = float(elem.get('z'))
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            st.found = True
+                            if x < st.minx:
+                                st.minx = x
+                            if x > st.maxx:
+                                st.maxx = x
+                            if y < st.miny:
+                                st.miny = y
+                            if y > st.maxy:
+                                st.maxy = y
+                            if z < st.minz:
+                                st.minz = z
+                            if z > st.maxz:
+                                st.maxz = z
+                elif lname == 'components':
+                    if parent is st.elem and st.comps_elem is None:
+                        st.comps_elem = elem
+                elif lname == 'component':
+                    if st.comps_elem is not None and parent is st.comps_elem:
+                        st.components.append((
+                            elem.get('objectid'),
+                            elem.get('transform'),
+                            _get_attr(elem, 'path'),
+                        ))
+            continue
+
+        # event == 'end'
+        stack.pop()
+        if lname == 'vertex' or lname == 'triangle':
+            leaf_count += 1
+            if leaf_count % _PRUNE_EVERY == 0 and stack:
+                del stack[-1][:]
+        elif lname in ('vertices', 'triangles', 'mesh', 'components'):
+            elem.clear()
+        elif lname == 'object':
+            st = obj_stack.pop()
+            st.aabb = ((st.minx, st.miny, st.minz, st.maxx, st.maxy, st.maxz)
+                       if st.found else None)
+            elem.clear()
+
+    objects = {}
+    for st in entries:
+        if st.oid is not None:
+            objects[st.oid] = {'aabb': st.aabb, 'components': st.components}
+    return _GeomIndex(objects)
+
+
+def make_zip_submodel_reader(zin):
+    """get_submodel_root factory for recenter_and_drop_model: streams each
+    submodel from the open ZipFile ONCE into a _GeomIndex (never a full DOM),
+    cached by normalized name. Missing entry -> None; malformed XML ->
+    ConversionError("Corrupt submodel '<name>': ...")."""
+    cache = {}
+    names = set(zin.namelist())
+
+    def _read(path):
+        name = str(path).lstrip('/')
+        if name in cache:
+            return cache[name]
+        idx = None
+        if name in names:
+            try:
+                with zin.open(name) as f:
+                    idx = _stream_geom_index(f)
+            except ET.ParseError as e:
+                raise ConversionError(f"Corrupt submodel '{name}': {e}")
+        cache[name] = idx
+        return idx
+
+    return _read
+
+
 def _collect_global_corners(file_path, object_id, A, t, get_root, corners, depth=0):
     """
     Recursively accumulate global-space AABB corners for an object.
@@ -421,14 +609,14 @@ def _collect_global_corners(file_path, object_id, A, t, get_root, corners, depth
             f"Component nesting exceeded depth 64 (objectid={object_id}); "
             f"aborting to avoid a cycle."
         )
-    root = get_root(file_path)
-    if root is None:
+    idx = _as_geom_index(get_root(file_path))
+    if idx is None:
         return  # missing submodel file -> contributes no geometry
-    obj = _object_map(root).get(str(object_id))
-    if obj is None:
+    info = idx.objects.get(str(object_id))
+    if info is None:
         return
 
-    aabb = _object_local_aabb(obj)
+    aabb = info['aabb']
     if aabb is not None:
         minx, miny, minz, maxx, maxy, maxz = aabb
         for cx in (minx, maxx):
@@ -436,22 +624,15 @@ def _collect_global_corners(file_path, object_id, A, t, get_root, corners, depth
                 for cz in (minz, maxz):
                     corners.append(_apply(A, t, (cx, cy, cz)))
 
-    comps = _find_child(obj, 'components')
-    if comps is not None:
-        for comp in comps:
-            if _lname(comp.tag) != 'component':
-                continue
-            cobjid = comp.get('objectid')
-            cpath = _get_attr(comp, 'path') or file_path
-            cA, cT = _parse_transform(
-                comp.get('transform'), f"component objectid={cobjid}"
-            )
-            # submodel-local -> object coords via (cA, cT); then -> global via (A, t)
-            newA = _matmul3(cA, A)
-            newT = list(_apply(A, t, cT))
-            _collect_global_corners(
-                cpath, cobjid, newA, newT, get_root, corners, depth + 1
-            )
+    for cobjid, ctransform, cpath_raw in info['components']:
+        cpath = cpath_raw or file_path
+        cA, cT = _parse_transform(ctransform, f"component objectid={cobjid}")
+        # submodel-local -> object coords via (cA, cT); then -> global via (A, t)
+        newA = _matmul3(cA, A)
+        newT = list(_apply(A, t, cT))
+        _collect_global_corners(
+            cpath, cobjid, newA, newT, get_root, corners, depth + 1
+        )
 
 
 def _collect_build_items(model_root):
@@ -492,10 +673,18 @@ def recenter_and_drop_model(model_root, get_submodel_root, bed):
     Raises ConversionError on: no build items, no resolvable geometry anywhere,
     malformed transforms, or a group that cannot fit the printable area.
     """
+    _idx_memo = {}  # path (str or _MAIN_MODEL sentinel) -> _GeomIndex or None
+
     def get_root(path):
-        if path is _MAIN_MODEL:
-            return model_root
-        return get_submodel_root(path)
+        # Returns a geometry index (or None). get_submodel_root may hand back a
+        # parsed root, a _GeomIndex, or None; _as_geom_index normalizes either
+        # way, and the memo derives the main-model index exactly once per convert.
+        if path in _idx_memo:
+            return _idx_memo[path]
+        node = model_root if path is _MAIN_MODEL else get_submodel_root(path)
+        idx = _as_geom_index(node)
+        _idx_memo[path] = idx
+        return idx
 
     items = _collect_build_items(model_root)
     if not items:
@@ -763,23 +952,10 @@ def convert_single_file(input_path, output_path, user_colors):
                     zin.read('3D/3dmodel.model').decode('utf-8')
                 )
 
-                # Cache parsed submodel roots read from the input archive.
-                _submodel_cache = {}
-
-                def _read_submodel(path):
-                    name = str(path).lstrip('/')
-                    if name in _submodel_cache:
-                        return _submodel_cache[name]
-                    root = None
-                    if name in zin.namelist():
-                        try:
-                            root = ET.fromstring(zin.read(name).decode('utf-8'))
-                        except ET.ParseError as e:
-                            raise ConversionError(
-                                f"Corrupt submodel '{name}': {e}"
-                            )
-                    _submodel_cache[name] = root
-                    return root
+                # Stream each submodel from the archive once into a geometry
+                # index (no full DOM of the 100+ MB meshes; they are only read
+                # for their bounding boxes and copied byte-for-byte on output).
+                _read_submodel = make_zip_submodel_reader(zin)
 
                 recenter_and_drop_model(model_3d_root, _read_submodel, bed)
 
