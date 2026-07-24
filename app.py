@@ -905,6 +905,78 @@ def convert_single_file(input_path, output_path, user_colors):
         return (False, str(e))
 
 
+def _plate_num(path):
+    m = re.search(r'_plate(\d+)', os.path.basename(path))
+    return m.group(1) if m else '1'
+
+
+def convert_or_split_plates(input_path, output_path, user_colors, base_name='model', save_dir=None):
+    """Convert a .3mf to Snapmaker U1, transparently handling multi-plate files.
+
+    - Single plate: converts to output_path (.3mf); produced_path is that file.
+    - Multiple plates: a 3MF can legitimately hold several plates, and the U1
+      prints one plate at a time — so instead of refusing, split into one file
+      per plate, convert each, and bundle the successes into a ZIP at
+      ``<output_path stem>.zip`` (produced_path is the ZIP).
+
+    If ``save_dir`` is set, the print-ready .3mf file(s) are also copied there
+    with friendly names (e.g. ``<name>_U1.3mf`` / ``<name>_plateN_U1.3mf``).
+    Returns ``(success, produced_path, message)``; message carries a warning
+    (e.g. partial plate success) or the error on failure.
+    """
+    plate_count = 1
+    try:
+        with zipfile.ZipFile(input_path) as z:
+            if 'Metadata/model_settings.config' in z.namelist():
+                plate_count = count_plates(ET.fromstring(
+                    z.read('Metadata/model_settings.config').decode('utf-8', 'ignore')))
+    except Exception:
+        plate_count = 1
+
+    def _save(src, nice):
+        if save_dir:
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                shutil.copy(src, os.path.join(save_dir, nice))
+            except Exception as e:
+                print(f"WARN: could not save '{nice}' to output folder '{save_dir}': {e}")
+
+    if plate_count <= 1:
+        ok, err = convert_single_file(input_path, output_path, user_colors)
+        if ok:
+            _save(output_path, f"{base_name}_U1.3mf")
+        return (ok, output_path if ok else None, None if ok else err)
+
+    # Multi-plate: split into single-plate files, convert each, bundle into a ZIP.
+    import tempfile
+    from split_plates import split_plates
+    with tempfile.TemporaryDirectory() as td:
+        ok, res = split_plates(input_path, td)
+        if not ok:
+            return (False, None, res)
+        converted, errors = [], []
+        for part in res:
+            num = _plate_num(part)
+            pout = os.path.join(td, f"part{num}_U1.3mf")
+            s, e = convert_single_file(part, pout, user_colors)
+            if s:
+                converted.append((pout, num))
+            else:
+                errors.append(f"plate {num}: {e}")
+        if not converted:
+            return (False, None, "No plate could be converted. " + " | ".join(errors))
+        zip_path = os.path.splitext(output_path)[0] + '.zip'
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for pout, num in converted:
+                nice = f"{base_name}_plate{num}_U1.3mf"
+                zf.write(pout, nice)
+                _save(pout, nice)
+        msg = None
+        if errors:
+            msg = f"{len(converted)} of {plate_count} plates converted. Skipped — {'; '.join(errors)}"
+        return (True, zip_path, msg)
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -962,17 +1034,28 @@ def convert():
 
     user_colors = data.get('colors', {})  # Dict {original_filament_id: {color: #hex, type: PLA}}
 
-    success, error = convert_single_file(input_path, output_path, user_colors)
+    # Also save print-ready file(s) to the configured output folder, if any.
+    save_dir = (history_manager.get_settings() or {}).get('output_folder') or None
+
+    # Multi-plate 3MFs are split into one file per plate and bundled as a ZIP.
+    success, produced, message = convert_or_split_plates(
+        input_path, output_path, user_colors, base_name=original_name, save_dir=save_dir)
 
     if success:
-        # Return download URL with original name for proper download filename
-        download_name = f"{original_name}_U1.3mf"
-        return jsonify({
-            'download_url': f'/download/{output_filename}',
-            'download_name': download_name
-        })
+        produced_filename = os.path.basename(produced)
+        is_zip = produced_filename.endswith('.zip')
+        download_name = f"{original_name}_U1_plates.zip" if is_zip else f"{original_name}_U1.3mf"
+        resp = {
+            'download_url': f'/download/{produced_filename}',
+            'download_name': download_name,
+        }
+        if message:
+            resp['warning'] = message
+        if save_dir:
+            resp['saved_to'] = save_dir
+        return jsonify(resp)
     else:
-        return jsonify({'error': error}), 500
+        return jsonify({'error': message}), 500
 
 
 @app.route('/batch-analyze', methods=['POST'])

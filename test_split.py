@@ -22,6 +22,7 @@ import pytest
 
 from app import (
     convert_single_file,
+    convert_or_split_plates,
     count_plates,
     _collect_build_items,
     CORE_NS,
@@ -294,3 +295,39 @@ def test_plate_without_instances_fails_loud(tmp_path):
     assert ok is False
     assert "plate 2" in result.lower()
     assert not [f for f in os.listdir(tmp_path) if "_plate" in f]
+
+
+# ===========================================================================
+# convert_or_split_plates: multi-plate -> ZIP of converted plates + saved to
+# the settings output folder; single-plate -> a single .3mf.
+# ===========================================================================
+def test_convert_or_split_multiplate_bundles_zip_and_saves(tmp_path):
+    src = str(tmp_path / "multi.3mf")
+    make_multi_plate_3mf(src, plates=3)
+    out = str(tmp_path / "sess_U1_Ready.3mf")
+    save_dir = str(tmp_path / "outfolder")
+
+    ok, produced, msg = convert_or_split_plates(
+        src, out, DEFAULT_COLORS, base_name="MyModel", save_dir=save_dir)
+
+    assert ok, msg
+    assert produced.endswith(".zip")
+    with zipfile.ZipFile(produced) as z:
+        entries = z.namelist()
+    assert entries == [f"MyModel_plate{k}_U1.3mf" for k in (1, 2, 3)]
+    # print-ready plate files also landed in the configured output folder
+    assert sorted(os.listdir(save_dir)) == [f"MyModel_plate{k}_U1.3mf" for k in (1, 2, 3)]
+
+
+def test_convert_or_split_singleplate_returns_3mf_and_saves(tmp_path):
+    src = str(tmp_path / "single.3mf")
+    make_multi_plate_3mf(src, plates=1)
+    out = str(tmp_path / "sess_U1_Ready.3mf")
+    save_dir = str(tmp_path / "outfolder")
+
+    ok, produced, msg = convert_or_split_plates(
+        src, out, DEFAULT_COLORS, base_name="Solo", save_dir=save_dir)
+
+    assert ok, msg
+    assert produced == out and produced.endswith(".3mf")
+    assert os.listdir(save_dir) == ["Solo_U1.3mf"]

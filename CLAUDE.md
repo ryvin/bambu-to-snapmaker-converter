@@ -78,6 +78,7 @@ python app.py
 - **Plate membership**: each `<plate>` block's `<model_instance>` children carry `<metadata key="object_id">` values matching build `<item objectid>` (verified against real 7-plate BambuStudio output).
 - **Fail-loud**: single-plate input, a plate with no `model_instance` objects, or an object_id with no matching build item all return `(False, msg)` BEFORE any output is written (no partial output set). Note: `zipfile.writestr` mutates a passed `ZipInfo`; the splitter writes with copies so the input infolist survives multiple output passes.
 - **CLI**: `python split_plates.py FILE [--outdir DIR]` — default writes beside the input.
+- **Web `/convert` uses it automatically** via `convert_or_split_plates(input, output, colors, base_name, save_dir)`: single-plate → one `_U1.3mf`; multi-plate → split + convert each plate → **ZIP** (`<name>_plate{k}_U1.3mf` entries) for download. A multi-plate file is never refused in the UI. If `save_dir` (the Settings `output_folder`) is set, the print-ready `.3mf`(s) are also copied there. Partial success (some plates too big / uncovered) returns the ZIP of the ones that worked plus a `warning`.
 
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)
