@@ -331,3 +331,34 @@ def test_convert_or_split_singleplate_returns_3mf_and_saves(tmp_path):
     assert ok, msg
     assert produced == out and produced.endswith(".3mf")
     assert os.listdir(save_dir) == ["Solo_U1.3mf"]
+
+
+def test_reconvert_clears_stale_plate_outputs(tmp_path):
+    """A re-conversion that yields fewer plates must not leave stale plate files
+    behind, and must not touch unrelated files in the output folder."""
+    save_dir = tmp_path / "outfolder"
+    save_dir.mkdir()
+    # Simulate a previous run that produced 5 plates + a zip, plus an unrelated
+    # file and a different model's output that must both survive.
+    for k in range(1, 6):
+        (save_dir / f"MyModel_plate{k}_U1.3mf").write_bytes(b"stale")
+    (save_dir / "MyModel_U1.zip").write_bytes(b"stale-zip")
+    (save_dir / "Other_plate1_U1.3mf").write_bytes(b"keep")
+    (save_dir / "notes.txt").write_bytes(b"keep")
+
+    src = str(tmp_path / "multi.3mf")
+    make_multi_plate_3mf(src, plates=3)
+    out = str(tmp_path / "sess_U1_Ready.3mf")
+    ok, produced, msg = convert_or_split_plates(
+        src, out, DEFAULT_COLORS, base_name="MyModel", save_dir=str(save_dir))
+
+    assert ok, msg
+    names = sorted(os.listdir(save_dir))
+    # Stale MyModel plates 4 & 5 and the old zip are gone; 1-3 are fresh; other
+    # files untouched.
+    assert names == [
+        "MyModel_plate1_U1.3mf", "MyModel_plate2_U1.3mf", "MyModel_plate3_U1.3mf",
+        "Other_plate1_U1.3mf", "notes.txt",
+    ]
+    # Plate 1 was rewritten (real conversion output), not the stale placeholder.
+    assert (save_dir / "MyModel_plate1_U1.3mf").read_bytes() != b"stale"

@@ -81,6 +81,7 @@ python app.py
 - **Fail-loud**: single-plate input, a plate with no `model_instance` objects, or an object_id with no matching build item all return `(False, msg)` BEFORE any output is written (no partial output set). Note: `zipfile.writestr` mutates a passed `ZipInfo`; the splitter writes with copies so the input infolist survives multiple output passes.
 - **CLI**: `python split_plates.py FILE [--outdir DIR]` — default writes beside the input.
 - **Web `/convert` uses it automatically** via `convert_or_split_plates(input, output, colors, base_name, save_dir)`: single-plate → one `_U1.3mf`; multi-plate → split + convert each plate → **ZIP** (`<name>_plate{k}_U1.3mf` entries) for download. A multi-plate file is never refused in the UI. If `save_dir` (the Settings `output_folder`) is set, the print-ready `.3mf`(s) are also copied there. Partial success (some plates too big / uncovered) returns the ZIP of the ones that worked plus a `warning`.
+- **Stale-output cleanup**: before saving into `save_dir`, `_clear_stale_outputs(save_dir, base_name)` deletes that base name's prior outputs (`<base>_U1.3mf`, `<base>_U1.zip`, `<base>_plate<N>_U1.3mf`) so a re-conversion that yields fewer plates never leaves stale plate files behind (e.g. old `_plate5..8`, or a leftover from an earlier buggy run that opens as "no geometry"). Runs only on success; matches this base name exactly and never touches other files.
 
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)

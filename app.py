@@ -1086,6 +1086,35 @@ def _plate_num(path):
     return m.group(1) if m else '1'
 
 
+def _clear_stale_outputs(save_dir, base_name):
+    """Remove this base name's prior U1 outputs from ``save_dir`` before writing
+    new ones, so a re-conversion never leaves stale files behind — e.g. old
+    ``_plate5..8`` when the new run only produces 4 plates, or a leftover from an
+    earlier buggy run. Matches exactly ``<base>_U1.3mf``, ``<base>_U1.zip`` and
+    ``<base>_plate<N>_U1.3mf`` (N = digits); never touches other files.
+    Returns the list of removed filenames.
+    """
+    if not save_dir or not os.path.isdir(save_dir):
+        return []
+    exact = {f"{base_name}_U1.3mf", f"{base_name}_U1.zip"}
+    plate_rx = re.compile(r'^' + re.escape(base_name) + r'_plate\d+_U1\.3mf$')
+    removed = []
+    try:
+        entries = os.listdir(save_dir)
+    except OSError:
+        return []
+    for name in entries:
+        if name in exact or plate_rx.match(name):
+            try:
+                os.remove(os.path.join(save_dir, name))
+                removed.append(name)
+            except OSError as e:
+                print(f"WARN: could not remove stale output '{name}': {e}")
+    if removed:
+        print(f"Cleared {len(removed)} stale output(s) for '{base_name}' in {save_dir}")
+    return removed
+
+
 def convert_or_split_plates(input_path, output_path, user_colors, base_name='model', save_dir=None):
     """Convert a .3mf to Snapmaker U1, transparently handling multi-plate files.
 
@@ -1120,6 +1149,7 @@ def convert_or_split_plates(input_path, output_path, user_colors, base_name='mod
     if plate_count <= 1:
         ok, err = convert_single_file(input_path, output_path, user_colors)
         if ok:
+            _clear_stale_outputs(save_dir, base_name)
             _save(output_path, f"{base_name}_U1.3mf")
         return (ok, output_path if ok else None, None if ok else err)
 
@@ -1141,6 +1171,7 @@ def convert_or_split_plates(input_path, output_path, user_colors, base_name='mod
                 errors.append(f"plate {num}: {e}")
         if not converted:
             return (False, None, "No plate could be converted. " + " | ".join(errors))
+        _clear_stale_outputs(save_dir, base_name)
         zip_path = os.path.splitext(output_path)[0] + '.zip'
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for pout, num in converted:
