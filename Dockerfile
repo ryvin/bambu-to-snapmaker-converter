@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir flask
 # Copy application files
 COPY app.py .
 COPY history.py .
+COPY split_plates.py .
+COPY refix.py .
 COPY templates/ templates/
 COPY u1_template.3mf .
 COPY u1_template_supports.3mf .

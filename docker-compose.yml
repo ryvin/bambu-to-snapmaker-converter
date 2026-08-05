@@ -8,6 +8,10 @@ services:
       # Persist conversion history and settings
       - ./data:/app/data
       # Mount E:\ drive for file access
+      # audit-ok: full-drive rw is load-bearing — converter reads source 3MFs
+      # and writes converted output files to arbitrary user-chosen paths
+      # anywhere on E:. Do NOT narrow to :ro or a subpath. (2026-07-22)
+      # access: exclusive (writes)
       - /mnt/e:/mnt/e
     environment:
       - FLASK_ENV=production
