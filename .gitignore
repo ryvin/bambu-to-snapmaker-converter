@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data & user files (history/settings persist in ./data; uploads and
+# converted outputs are generated at runtime — never source)
+/data/
+/uploads/
+/converted_u1/
+conversion_history.json
+
+# Editor / tool scratch
+.playwright-mcp/
+*.bak
+*.bak.*
+
+# Scratch screenshots at repo root (the repo has no committed PNG assets)
+/*.png
