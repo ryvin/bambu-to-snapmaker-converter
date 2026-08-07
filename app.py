@@ -1371,17 +1371,11 @@ def batch_convert():
             skipped_files.append({'filename': filename, 'reason': 'Already converted'})
             continue
 
-        # Generate output filename with versioning
+        # One deterministic output per model: overwrite any prior output
+        # instead of creating _v2/_v3 duplicates of identical content.
         base_name = os.path.splitext(filename)[0]
         output_filename = f"{base_name}_U1.3mf"
         output_path = os.path.join(output_folder, output_filename)
-
-        # Version if exists
-        version = 2
-        while os.path.exists(output_path):
-            output_filename = f"{base_name}_U1_v{version}.3mf"
-            output_path = os.path.join(output_folder, output_filename)
-            version += 1
 
         filaments = parse_bambu_filaments(input_path)
         success, error = convert_single_file(input_path, output_path, auto_colors)
@@ -1446,6 +1440,30 @@ def clear_history():
     """Clear conversion history."""
     history_manager.clear_history()
     return jsonify({'success': True})
+
+
+@app.route('/dedup-outputs', methods=['POST'])
+def dedup_outputs():
+    """Remove byte-identical duplicate .3mf files from the Settings output
+    folder, keeping one canonical copy per group (lossless). POST body
+    {"apply": true} deletes; otherwise it's a dry run reporting what it would
+    remove."""
+    from dedup import dedup_folder
+    settings = history_manager.get_settings()
+    folder = settings.get('output_folder')
+    if not folder or not os.path.isdir(folder):
+        return jsonify({'error': f'Output folder not set or not found: {folder!r}'}), 400
+    apply = bool((request.get_json(silent=True) or {}).get('apply', False))
+    rep = dedup_folder(folder, apply=apply)
+    return jsonify({
+        'success': True,
+        'applied': apply,
+        'groups': rep['groups'],
+        'removed_count': rep['removed_count'],
+        'mb_freed': round(rep['bytes_freed'] / 1e6, 1),
+        'kept': [os.path.basename(p['keep']) for p in rep['pairs']],
+        'removed': [os.path.basename(r) for p in rep['pairs'] for r in p['removed']],
+    })
 
 
 @app.route('/browse', methods=['GET'])
@@ -1573,17 +1591,11 @@ def convert_new_files():
         filaments = parse_bambu_filaments(filepath)
         auto_colors = auto_map_filaments(filaments)
 
-        # Generate output filename with versioning
+        # One deterministic output per model: overwrite any prior output
+        # instead of creating _v2/_v3 duplicates of identical content.
         base_name = os.path.splitext(filename)[0]
         output_filename = f"{base_name}_U1.3mf"
         output_path = os.path.join(output_folder, output_filename)
-
-        # Version if exists
-        version = 2
-        while os.path.exists(output_path):
-            output_filename = f"{base_name}_U1_v{version}.3mf"
-            output_path = os.path.join(output_folder, output_filename)
-            version += 1
 
         success, error = convert_single_file(filepath, output_path, auto_colors)
 
@@ -1638,17 +1650,11 @@ def convert_single_source_file():
     filaments = parse_bambu_filaments(filepath)
     auto_colors = auto_map_filaments(filaments)
 
-    # Generate output filename with versioning
+    # One deterministic output per model: overwrite any prior output
+    # instead of creating _v2/_v3 duplicates of identical content.
     base_name = os.path.splitext(filename)[0]
     output_filename = f"{base_name}_U1.3mf"
     output_path = os.path.join(output_folder, output_filename)
-
-    # Version if exists
-    version = 2
-    while os.path.exists(output_path):
-        output_filename = f"{base_name}_U1_v{version}.3mf"
-        output_path = os.path.join(output_folder, output_filename)
-        version += 1
 
     success, error = convert_single_file(filepath, output_path, auto_colors)
 

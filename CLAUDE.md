@@ -83,6 +83,11 @@ python app.py
 - **Web `/convert` uses it automatically** via `convert_or_split_plates(input, output, colors, base_name, save_dir)`: single-plate → one `_U1.3mf`; multi-plate → split + convert each plate → **ZIP** (`<name>_plate{k}_U1.3mf` entries) for download. A multi-plate file is never refused in the UI. If `save_dir` (the Settings `output_folder`) is set, the print-ready `.3mf`(s) are also copied there. Partial success (some plates too big / uncovered) returns the ZIP of the ones that worked plus a `warning`.
 - **Stale-output cleanup**: before saving into `save_dir`, `_clear_stale_outputs(save_dir, base_name)` deletes that base name's prior outputs (`<base>_U1.3mf`, `<base>_U1.zip`, `<base>_plate<N>_U1.3mf`) so a re-conversion that yields fewer plates never leaves stale plate files behind (e.g. old `_plate5..8`, or a leftover from an earlier buggy run that opens as "no geometry"). Runs only on success; matches this base name exactly and never touches other files.
 
+### Duplicate Handling (`dedup.py`)
+- **No more `_v2`/`_v3` outputs**: the batch routes (`/batch-convert`, `/convert-new`, `/convert-file`) used to append `_U1_v{N}` whenever the target name existed, producing byte-identical copies on re-conversion. They now write one deterministic `<base>_U1.3mf` and **overwrite** it (the interactive `/convert` route already overwrites via `_clear_stale_outputs`).
+- **`dedup.py`**: `find_duplicate_groups(folder, pattern)` / `dedup_folder(folder, pattern, apply)` group files by **content hash** (size prefilter → md5) and keep one canonical name per group (prefers no `_v<N>` suffix, then no ` (N)` copy suffix, then shortest, then oldest); removing a byte-identical dup is lossless. CLI: `python dedup.py FOLDER [--pattern '*.3mf'] [--apply]` (dry run without `--apply`).
+- **In-app**: `POST /dedup-outputs {apply: bool}` dedupes the Settings `output_folder` and returns a report; the Settings panel has a **"Remove duplicate files"** button (dry-run → confirm → apply).
+
 ### Batch Conversion
 - **`is_bambu_file(filepath)`**: Checks if a .3mf is from Bambu Lab (not already Snapmaker)
 - **`auto_map_filaments(filaments)`**: Automatically maps filament types to closest U1 profiles (PLA→PLA, PETG→PETG-HF, etc.)

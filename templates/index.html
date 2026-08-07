@@ -106,6 +106,14 @@
                             <button id="clear-history" class="text-sm text-red-400 hover:text-red-300">Clear History</button>
                         </div>
                     </div>
+
+                    <hr class="border-slate-600">
+
+                    <div>
+                        <p class="text-sm text-slate-400">Remove byte-identical duplicate outputs (keeps one copy each).</p>
+                        <button id="dedup-outputs" class="text-sm text-amber-400 hover:text-amber-300 mt-2"><i class="fa-solid fa-broom mr-1"></i>Remove duplicate files</button>
+                        <p id="dedup-status" class="text-xs text-slate-500 mt-1"></p>
+                    </div>
                 </div>
             </div>
         </div>
@@ -840,6 +848,30 @@
             if (confirm('Clear all conversion history?')) {
                 await fetch('/history/clear', { method: 'POST' });
                 document.getElementById('history-count').textContent = '0';
+            }
+        });
+
+        // Remove duplicate output files (dry-run -> confirm -> apply)
+        document.getElementById('dedup-outputs').addEventListener('click', async () => {
+            const status = document.getElementById('dedup-status');
+            status.textContent = 'Scanning for duplicates…';
+            try {
+                const dry = await (await fetch('/dedup-outputs', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ apply: false })
+                })).json();
+                if (dry.error) { status.textContent = 'Error: ' + dry.error; return; }
+                if (!dry.removed_count) { status.textContent = 'No duplicate files found.'; return; }
+                if (!confirm(`Remove ${dry.removed_count} duplicate file(s) (${dry.mb_freed} MB), keeping one copy of each?`)) {
+                    status.textContent = 'Cancelled.'; return;
+                }
+                const res = await (await fetch('/dedup-outputs', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ apply: true })
+                })).json();
+                status.textContent = `Removed ${res.removed_count} duplicate file(s), freed ${res.mb_freed} MB.`;
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
             }
         });
 
