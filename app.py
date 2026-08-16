@@ -3,6 +3,7 @@ import zipfile
 import shutil
 import re
 import json
+import copy
 import uuid
 import time
 import math
@@ -11,6 +12,94 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from flask import Flask, render_template, request, send_file, jsonify
 from history import HistoryManager
+
+# Per-filament project_settings.config keys that do NOT start with 'filament_'
+# and therefore were previously left at the template's length 4, producing an
+# inconsistent output (filament arrays length N, these length 4) that Snapmaker
+# Orca rejects for N>4-color files. These MUST be resized to the filament count.
+# Ground truth: keys that track filament count in Snapmaker-Orca's own re-saved
+# U1 files at N=5/6/7 (e.g. 580MM_U1_v3.3mf, ButterflyWing_fans_U1.3mf), 2026-08.
+# Per-EXTRUDER keys (nozzle_diameter, extruder_*, retraction_*, wipe*, z_hop*)
+# are intentionally EXCLUDED — the U1 is 4 single-nozzle tools, so they stay 4.
+U1_PER_FILAMENT_EXTRA_KEYS = frozenset({
+    'activate_air_filtration', 'activate_chamber_temp_control',
+    'adaptive_pressure_advance', 'adaptive_pressure_advance_bridges',
+    'adaptive_pressure_advance_model', 'adaptive_pressure_advance_overhangs',
+    'additional_cooling_fan_speed', 'chamber_temperature',
+    'close_fan_the_first_x_layers', 'complete_print_exhaust_fan_speed',
+    'cool_plate_temp', 'cool_plate_temp_initial_layer', 'default_filament_colour',
+    'dont_slow_down_outer_wall', 'during_print_exhaust_fan_speed',
+    'enable_overhang_bridge_fan', 'enable_pressure_advance',
+    'eng_plate_temp', 'eng_plate_temp_initial_layer', 'fan_cooling_layer_time',
+    'fan_max_speed', 'fan_min_speed', 'full_fan_speed_layer',
+    'graphic_effect_plate_temp', 'graphic_effect_plate_temp_initial_layer',
+    'hot_plate_temp', 'hot_plate_temp_initial_layer', 'idle_temperature',
+    'internal_bridge_fan_speed', 'ironing_fan_speed',
+    'nozzle_temperature', 'nozzle_temperature_initial_layer',
+    'nozzle_temperature_range_high', 'nozzle_temperature_range_low',
+    'overhang_fan_speed', 'overhang_fan_threshold', 'pellet_flow_coefficient',
+    'pressure_advance', 'reduce_fan_stop_start_freq', 'required_nozzle_HRC',
+    'slow_down_for_layer_cooling', 'slow_down_layer_time', 'slow_down_min_speed',
+    'supertack_plate_temp', 'supertack_plate_temp_initial_layer',
+    'support_material_interface_fan_speed', 'temperature_vitrification',
+    'textured_cool_plate_temp', 'textured_cool_plate_temp_initial_layer',
+    'textured_plate_temp', 'textured_plate_temp_initial_layer',
+})
+
+# Value Snapmaker Orca writes into new inter-filament flush cells when it grows
+# a 4-filament project to N (any positive value loads; Orca recomputes from
+# colors on demand). Verified against Orca's own 4->7 re-save.
+_FLUSH_FILL = '280'
+
+
+def _resize_filament_settings(ps, num_filaments):
+    """Resize every PER-FILAMENT array in a project_settings dict to
+    ``num_filaments`` (in place), and rebuild the inter-filament flush matrix
+    (N*N, diagonal '0') and vector (2N).
+
+    Per-filament = keys starting with ``filament_`` plus the non-prefixed
+    per-filament keys in ``U1_PER_FILAMENT_EXTRA_KEYS`` (temperatures, plate
+    temps, fan speeds, pressure advance, ...). PER-EXTRUDER keys (nozzle_diameter,
+    extruder_*, retraction_*, wipe*, z_hop*) and per-plate keys (wipe_tower_x/y)
+    are intentionally left untouched — the U1 is 4 single-nozzle tools.
+    Empty lists are left as-is. Raises ConversionError on a non-square flush
+    matrix. Returns ``ps``.
+    """
+    for key, val in list(ps.items()):
+        if not isinstance(val, list) or not val:
+            continue
+        if not (key.startswith('filament_') or key in U1_PER_FILAMENT_EXTRA_KEYS):
+            continue
+        cur = len(val)
+        if cur == num_filaments:
+            continue
+        if num_filaments > cur:
+            ps[key] = val + [val[-1]] * (num_filaments - cur)  # extend with last
+        else:
+            ps[key] = val[:num_filaments]
+
+    matrix = ps.get('flush_volumes_matrix')
+    if isinstance(matrix, list) and matrix:
+        old_n = int(round(len(matrix) ** 0.5))
+        if old_n * old_n != len(matrix):
+            raise ConversionError(
+                f"flush_volumes_matrix is not square (len={len(matrix)}); "
+                f"cannot rebuild for {num_filaments} filaments."
+            )
+        ps['flush_volumes_matrix'] = [
+            '0' if i == j
+            else matrix[i * old_n + j] if (i < old_n and j < old_n)
+            else _FLUSH_FILL
+            for i in range(num_filaments) for j in range(num_filaments)
+        ]
+
+    vector = ps.get('flush_volumes_vector')
+    if isinstance(vector, list) and vector:
+        target = 2 * num_filaments
+        ps['flush_volumes_vector'] = (
+            vector + [vector[-1]] * (target - len(vector)) if len(vector) < target
+            else vector[:target])
+    return ps
 
 
 class ConversionError(Exception):
@@ -967,7 +1056,7 @@ def convert_single_file(input_path, output_path, user_colors):
                 # --- Start Project Settings Modification ---
                 # Combine U1 printer settings with user-selected filament colors
                 # Start with U1 template settings (for printer configuration)
-                combined_project_settings = u1_project_settings_json.copy()
+                combined_project_settings = copy.deepcopy(u1_project_settings_json)
 
                 # Get the number of filaments from the original file
                 original_filaments = parse_bambu_filaments(input_path)
@@ -1022,18 +1111,11 @@ def convert_single_file(input_path, output_path, user_colors):
                     new_filament_settings_ids.append(profile)
                 combined_project_settings['filament_settings_id'] = new_filament_settings_ids
 
-                # Adjust other filament arrays to match actual filament count
-                for key in combined_project_settings:
-                    if key.startswith('filament_') and isinstance(combined_project_settings[key], list):
-                        current_len = len(combined_project_settings[key])
-                        if current_len > 0 and current_len != num_filaments:
-                            if num_filaments > current_len:
-                                # Extend by repeating the last value
-                                last_val = combined_project_settings[key][-1]
-                                combined_project_settings[key].extend([last_val] * (num_filaments - current_len))
-                            else:
-                                # Truncate to match actual count
-                                combined_project_settings[key] = combined_project_settings[key][:num_filaments]
+                # Make EVERY per-filament array (and the flush structures)
+                # length N, so the output is internally consistent for any color
+                # count the U1 supports — the fix for >4-color files that
+                # Snapmaker Orca previously rejected.
+                _resize_filament_settings(combined_project_settings, num_filaments)
 
                 # Convert to JSON string
                 combined_project_settings_str = json.dumps(combined_project_settings, indent=4, ensure_ascii=False)

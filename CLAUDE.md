@@ -57,7 +57,7 @@ python app.py
    - `Metadata/model_settings.config` (XML) - extruder references for painted regions (remapped via `id_mapping`; an unmapped reference raises rather than corrupting color)
    - `Metadata/project_settings.config` (JSON) - printer settings, filament colors/types
    - `3D/3dmodel.model` (XML) - group-recenter + per-item drop-to-bed
-7. Pads to 4 filaments (U1 hardware requirement) with white PLA
+7. **Filament count = the source's color count (min 4), fully consistent.** The U1 prints >4 colors (4 tools + swaps), so the output is NOT capped at 4 — it carries N filaments (padded up to 4 with white PLA when fewer). `_resize_filament_settings()` resizes **every** per-filament array in `project_settings.config` to N — both `filament_*` keys AND the ~51 per-filament keys that lack that prefix (`nozzle_temperature*`, plate temps, fan speeds, `pressure_advance`, `required_nozzle_HRC`, …, in `U1_PER_FILAMENT_EXTRA_KEYS`) — and rebuilds the inter-filament flush **matrix** (N×N, diagonal `'0'`, top-left 4×4 preserved, new pairs `'280'`) and **vector** (2N). Per-**extruder** arrays (`nozzle_diameter`, `extruder_*`, `retraction_*`, `wipe*`, `z_hop*`) stay at 4; per-**plate** `wipe_tower_x/y` untouched. Previously only `filament_*` was extended, leaving temps/matrix at 4 → Snapmaker Orca rejected >4-color files. Key classification is ground-truthed against Orca's own re-saved U1 files at N=5/6/7; verified in `test_filament_arrays.py`.
 8. Writes new .3mf archive
 
 ### Auto-Center / Drop-to-Bed Feature (`recenter_and_drop_model()`)
