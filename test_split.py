@@ -301,7 +301,7 @@ def test_plate_without_instances_fails_loud(tmp_path):
 # convert_or_split_plates: multi-plate -> ZIP of converted plates + saved to
 # the settings output folder; single-plate -> a single .3mf.
 # ===========================================================================
-def test_convert_or_split_multiplate_bundles_zip_and_saves(tmp_path):
+def test_convert_or_split_multiplate_one_file_and_saves(tmp_path):
     src = str(tmp_path / "multi.3mf")
     make_multi_plate_3mf(src, plates=3)
     out = str(tmp_path / "sess_U1_Ready.3mf")
@@ -311,12 +311,13 @@ def test_convert_or_split_multiplate_bundles_zip_and_saves(tmp_path):
         src, out, DEFAULT_COLORS, base_name="MyModel", save_dir=save_dir)
 
     assert ok, msg
-    assert produced.endswith(".zip")
+    # Multi-plate is now kept in ONE file (Orca's plate grid), not a ZIP.
+    assert produced.endswith(".3mf") and not produced.endswith(".zip")
     with zipfile.ZipFile(produced) as z:
-        entries = z.namelist()
-    assert entries == [f"MyModel_plate{k}_U1.3mf" for k in (1, 2, 3)]
-    # print-ready plate files also landed in the configured output folder
-    assert sorted(os.listdir(save_dir)) == [f"MyModel_plate{k}_U1.3mf" for k in (1, 2, 3)]
+        ms = z.read('Metadata/model_settings.config').decode('utf-8', 'ignore')
+    assert ms.count('<plate>') == 3                     # all three plates in one file
+    # a single print-ready file lands in the configured output folder
+    assert os.listdir(save_dir) == ["MyModel_U1.3mf"]
 
 
 def test_convert_or_split_singleplate_returns_3mf_and_saves(tmp_path):
@@ -334,12 +335,12 @@ def test_convert_or_split_singleplate_returns_3mf_and_saves(tmp_path):
 
 
 def test_reconvert_clears_stale_plate_outputs(tmp_path):
-    """A re-conversion that yields fewer plates must not leave stale plate files
-    behind, and must not touch unrelated files in the output folder."""
+    """A re-conversion must clear this model's prior outputs (old per-plate files
+    AND zip) and must not touch unrelated files in the output folder."""
     save_dir = tmp_path / "outfolder"
     save_dir.mkdir()
-    # Simulate a previous run that produced 5 plates + a zip, plus an unrelated
-    # file and a different model's output that must both survive.
+    # Simulate a previous (split-era) run: per-plate files + a zip, plus an
+    # unrelated file and a different model's output that must both survive.
     for k in range(1, 6):
         (save_dir / f"MyModel_plate{k}_U1.3mf").write_bytes(b"stale")
     (save_dir / "MyModel_U1.zip").write_bytes(b"stale-zip")
@@ -354,11 +355,54 @@ def test_reconvert_clears_stale_plate_outputs(tmp_path):
 
     assert ok, msg
     names = sorted(os.listdir(save_dir))
-    # Stale MyModel plates 4 & 5 and the old zip are gone; 1-3 are fresh; other
-    # files untouched.
-    assert names == [
-        "MyModel_plate1_U1.3mf", "MyModel_plate2_U1.3mf", "MyModel_plate3_U1.3mf",
-        "Other_plate1_U1.3mf", "notes.txt",
-    ]
-    # Plate 1 was rewritten (real conversion output), not the stale placeholder.
-    assert (save_dir / "MyModel_plate1_U1.3mf").read_bytes() != b"stale"
+    # Multi-plate now yields ONE file; all stale MyModel plate files + the zip
+    # are gone; unrelated files untouched.
+    assert names == ["MyModel_U1.3mf", "Other_plate1_U1.3mf", "notes.txt"]
+    assert (save_dir / "MyModel_U1.3mf").read_bytes() != b"stale"
+
+
+def test_compute_plate_cols_matches_orca():
+    """Grid column count Orca uses (round(sqrt(n)), rounded up when sqrt>round).
+    Verified against real Orca U1 files at N=2/5/6/8/10/16."""
+    from app import compute_plate_cols
+    expected = {1: 1, 2: 2, 3: 2, 4: 2, 5: 3, 6: 3, 7: 3, 8: 3, 9: 3,
+                10: 4, 12: 4, 16: 4}
+    for n, cols in expected.items():
+        assert compute_plate_cols(n) == cols, f"n={n}"
+
+
+def test_multiplate_plates_land_on_distinct_grid_cells(tmp_path):
+    """Each plate's items are recentered onto their own Orca grid cell, so
+    consecutive plates in row 0 are offset by the X stride (bed.width * 1.2)."""
+    import xml.etree.ElementTree as ET
+    from app import (count_plates, compute_plate_cols, plate_cell_center,
+                     parse_printable_area, _collect_build_items, make_zip_submodel_reader,
+                     _MAIN_MODEL, _collect_global_corners, _parse_transform, _plate_object_ids)
+    src = str(tmp_path / "multi.3mf")
+    make_multi_plate_3mf(src, plates=3)
+    out = str(tmp_path / "o.3mf")
+    ok, produced, msg = convert_or_split_plates(src, out, DEFAULT_COLORS, base_name="G", save_dir=None)
+    assert ok, msg
+    with zipfile.ZipFile(produced) as z:
+        ms = ET.fromstring(z.read('Metadata/model_settings.config').decode('utf-8', 'ignore'))
+        import json as _json
+        bed = parse_printable_area(_json.loads(z.read('Metadata/project_settings.config').decode('utf-8')))
+        root = ET.fromstring(z.read('3D/3dmodel.model').decode('utf-8'))
+        reader = make_zip_submodel_reader(z)
+        getr = lambda p: root if p is _MAIN_MODEL else reader(p)
+        items = {it.get('objectid'): it for it in _collect_build_items(root)}
+        N = count_plates(ms); cols = compute_plate_cols(N)
+        for k, plate in enumerate(ms.findall('.//plate'), start=1):
+            box = [1e9] * 2 + [-1e9] * 2
+            for oid in _plate_object_ids(plate):
+                it = items.get(oid)
+                if it is None:
+                    continue
+                A, t = _parse_transform(it.get('transform'), 'x'); c = []
+                _collect_global_corners(_MAIN_MODEL, oid, A, t, getr, c)
+                for p in c:
+                    box[0] = min(box[0], p[0]); box[2] = max(box[2], p[0])
+                    box[1] = min(box[1], p[1]); box[3] = max(box[3], p[1])
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            exp = plate_cell_center(k, cols, bed)
+            assert abs(cx - exp[0]) < 1e-6 and abs(cy - exp[1]) < 1e-6, f"plate {k}"

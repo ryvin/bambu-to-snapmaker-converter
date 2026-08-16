@@ -397,11 +397,14 @@ def test_part_relative_z_preserved_and_item_dropped(tmp_path):
 # Test 8: multi-plate -> refuse with a clear error (policy iii)
 # ===========================================================================
 def test_multiplate_refused_with_clear_error(tmp_path):
+    # merge_plates=False is the legacy split path's contract: it still refuses a
+    # multi-plate file (the split feeds it one plate at a time). merge_plates=True
+    # (default) keeps all plates in one file instead — covered in test_split.py.
     src = str(tmp_path / "multi.3mf")
     out = str(tmp_path / "multi_out.3mf")
     make_single_plate_3mf(src, plates=3)
 
-    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS, merge_plates=False)
     assert ok is False
     assert "3" in err  # plate count surfaced
     assert "plate" in err.lower()
@@ -412,10 +415,10 @@ def test_real_fixture_refused_as_multiplate(tmp_path):
         pytest.skip("real 6-plate fixture not present")
     out = str(tmp_path / "real_out.3mf")
     colors = {"1": {"color": "#FF0000FF", "type": "PLA"}}
-    ok, err = convert_single_file(REAL_FIXTURE, out, colors)
+    ok, err = convert_single_file(REAL_FIXTURE, out, colors, merge_plates=False)
     assert ok is False
     # The real file's plate count can change between sessions; assert the
-    # multi-plate refusal shape, not a hard-coded count.
+    # multi-plate refusal shape (split path), not a hard-coded count.
     import re as _re
     assert _re.search(r"contains \d+ plates", err)
     assert "plate" in err.lower()
