@@ -102,6 +102,18 @@ def _resize_filament_settings(ps, num_filaments):
     return ps
 
 
+def _resize_plate_settings(ps, n_plates):
+    """Per-plate project_settings arrays must have one entry per plate. Only
+    ``wipe_tower_x``/``wipe_tower_y`` are per-plate for the U1 (verified against
+    Orca's own multi-plate files); repeat the template's bed-local value.
+    ``first_layer_print_sequence`` etc. are NOT per-plate — left untouched."""
+    for key in ('wipe_tower_x', 'wipe_tower_y'):
+        val = ps.get(key)
+        if isinstance(val, list) and val and len(val) != n_plates:
+            ps[key] = ([val[0]] * n_plates)
+    return ps
+
+
 class ConversionError(Exception):
     """Raised for any recoverable failure during .3mf conversion.
 
@@ -748,19 +760,25 @@ def _fmt_transform(A, t):
     return ' '.join(repr(v) for v in (list(A) + list(t)))
 
 
-def recenter_and_drop_model(model_root, get_submodel_root, bed):
+def recenter_and_drop_model(model_root, get_submodel_root, bed, plate_groups=None):
     """
-    Rigidly translate the whole build as a group so its mesh-derived XY
-    bounding box is centered on the bed, and drop each item to the bed by its
+    Rigidly translate build items as group(s) so each group's mesh-derived XY
+    bounding box is centered on a target, and drop each item to the bed by its
     own world-space minimum Z. Relative layout and every item's rotation/scale
     (A) and inter-item offsets are preserved.
 
     - model_root: parsed root of 3dmodel.model (mutated in place).
     - get_submodel_root: callable(path)->root or None for component submodels.
-    - bed: BedBounds (target center + fit check).
+    - bed: BedBounds (fit check + single-plate target center).
+    - plate_groups: None -> recenter ALL items as one group onto the bed center
+      (single-plate; byte-identical to the pre-multiplate behaviour). Otherwise
+      an ordered list of ``(object_id_set, (target_cx, target_cy))`` — each
+      plate's items are recentered independently onto their target (grid cell)
+      center, so all plates coexist in one file (Orca's plate grid).
 
-    Raises ConversionError on: no build items, no resolvable geometry anywhere,
-    malformed transforms, or a group that cannot fit the printable area.
+    Raises ConversionError on: no build items, no resolvable geometry in a group,
+    malformed transforms, a group that cannot fit the printable area, or an item
+    that belongs to no plate / more than one plate.
     """
     _idx_memo = {}  # path (str or _MAIN_MODEL sentinel) -> _GeomIndex or None
 
@@ -779,11 +797,8 @@ def recenter_and_drop_model(model_root, get_submodel_root, bed):
     if not items:
         raise ConversionError("3dmodel.model has no build <item>; nothing to place.")
 
-    resolved = []  # (item_elem, A, t, world_minz_or_None)
-    g_minx = g_miny = math.inf
-    g_maxx = g_maxy = -math.inf
-    any_geom = False
-
+    # Resolve each item once: transform, world-min-Z, and world XY bbox.
+    resolved = []  # (item, A, t, world_minz_or_None, (minx,maxx,miny,maxy) or None)
     for item in items:
         objid = item.get('objectid')
         A, t = _parse_transform(item.get('transform'), f"build item objectid={objid}")
@@ -793,46 +808,72 @@ def recenter_and_drop_model(model_root, get_submodel_root, bed):
             xs = [c[0] for c in corners]
             ys = [c[1] for c in corners]
             zs = [c[2] for c in corners]
-            imnx, imxx = min(xs), max(xs)
-            imny, imxy = min(ys), max(ys)
-            imnz = min(zs)
-            g_minx, g_maxx = min(g_minx, imnx), max(g_maxx, imxx)
-            g_miny, g_maxy = min(g_miny, imny), max(g_maxy, imxy)
-            any_geom = True
-            resolved.append((item, A, t, imnz))
+            resolved.append((item, A, t, min(zs), (min(xs), max(xs), min(ys), max(ys))))
         else:
             print(
                 f"WARN: build item objectid={objid} has no resolvable geometry; "
                 f"applying group shift but skipping drop-to-bed."
             )
-            resolved.append((item, A, t, None))
+            resolved.append((item, A, t, None, None))
 
-    if not any_geom:
-        raise ConversionError(
-            "No build item has resolvable geometry; cannot recenter the model."
-        )
+    # Build the groups to recenter. None -> one group of all items onto the bed
+    # center (single-plate). Else one group per plate onto its grid-cell center.
+    if plate_groups is None:
+        groups = [(list(range(len(resolved))), (bed.center_x, bed.center_y), None)]
+    else:
+        obj_to_group = {}
+        for gi, (idset, _center) in enumerate(plate_groups):
+            for oid in idset:
+                if oid in obj_to_group:
+                    raise ConversionError(
+                        f"object_id {oid} is assigned to more than one plate; cannot place it.")
+                obj_to_group[oid] = gi
+        members = [[] for _ in plate_groups]
+        for ri, entry in enumerate(resolved):
+            oid = entry[0].get('objectid')
+            gi = obj_to_group.get(oid)
+            if gi is None:
+                raise ConversionError(
+                    f"build item objectid={oid} is not on any plate; cannot place it.")
+            members[gi].append(ri)
+        groups = [(members[gi], plate_groups[gi][1], gi + 1) for gi in range(len(plate_groups))]
 
-    group_w = g_maxx - g_minx
-    group_h = g_maxy - g_miny
-    if group_w > bed.width + _Z_DROP_EPS or group_h > bed.height + _Z_DROP_EPS:
-        raise ConversionError(
-            f"Model spans {group_w:.1f}mm x {group_h:.1f}mm but the U1 printable "
-            f"area is only {bed.width:.1f}mm x {bed.height:.1f}mm; it will not fit. "
-            f"Re-export a single plate that fits the bed."
-        )
-
-    group_cx = (g_minx + g_maxx) / 2.0
-    group_cy = (g_miny + g_maxy) / 2.0
-    dx = bed.center_x - group_cx
-    dy = bed.center_y - group_cy
-
-    for item, A, t, world_minz in resolved:
-        tx = t[0] + dx
-        ty = t[1] + dy
-        tz = t[2]
-        if world_minz is not None and abs(world_minz) > _Z_DROP_EPS:
-            tz = t[2] - world_minz
-        item.set('transform', _fmt_transform(A, [tx, ty, tz]))
+    for member_indices, (target_cx, target_cy), plate_label in groups:
+        g_minx = g_miny = math.inf
+        g_maxx = g_maxy = -math.inf
+        any_geom = False
+        for ri in member_indices:
+            bbox = resolved[ri][4]
+            if bbox is None:
+                continue
+            imnx, imxx, imny, imxy = bbox
+            g_minx, g_maxx = min(g_minx, imnx), max(g_maxx, imxx)
+            g_miny, g_maxy = min(g_miny, imny), max(g_maxy, imxy)
+            any_geom = True
+        if not any_geom:
+            raise ConversionError(
+                "No build item has resolvable geometry; cannot recenter the model."
+                if plate_label is None
+                else f"No build item on plate {plate_label} has resolvable geometry; cannot recenter it.")
+        group_w = g_maxx - g_minx
+        group_h = g_maxy - g_miny
+        if group_w > bed.width + _Z_DROP_EPS or group_h > bed.height + _Z_DROP_EPS:
+            noun = "Model" if plate_label is None else f"Plate {plate_label}"
+            raise ConversionError(
+                f"{noun} spans {group_w:.1f}mm x {group_h:.1f}mm but the U1 printable "
+                f"area is only {bed.width:.1f}mm x {bed.height:.1f}mm; it will not fit. "
+                f"Re-export a single plate that fits the bed."
+            )
+        dx = target_cx - (g_minx + g_maxx) / 2.0
+        dy = target_cy - (g_miny + g_maxy) / 2.0
+        for ri in member_indices:
+            item, A, t, world_minz, _bbox = resolved[ri]
+            tx = t[0] + dx
+            ty = t[1] + dy
+            tz = t[2]
+            if world_minz is not None and abs(world_minz) > _Z_DROP_EPS:
+                tz = t[2] - world_minz
+            item.set('transform', _fmt_transform(A, [tx, ty, tz]))
 
 
 def count_plates(model_settings_root):
@@ -840,14 +881,56 @@ def count_plates(model_settings_root):
     return len(model_settings_root.findall('.//plate'))
 
 
-def convert_single_file(input_path, output_path, user_colors):
+# --- Multi-plate-in-one-file layout ------------------------------------------
+# Snapmaker Orca (OrcaSlicer lineage) arranges plates in a grid whose stride is
+# the printable-area size * (1 + 1/5); the per-plate offset is IMPLICIT from the
+# plate's document order (NOT stored in the file), so a converted multi-plate
+# file must place each plate's objects at exactly the cell Orca computes or the
+# print lands off-bed. Constants verified against OrcaSlicer PartPlate.cpp and
+# Snapmaker-Orca's own U1 files at N=2/5/6/8/10 (stride 324.0mm for the 270mm
+# U1 bed, exact to the decimal). See reference_printer memory.
+PLATE_GRID_GAP = 0.2  # LOGICAL_PART_PLATE_GAP = 1/5 (OrcaSlicer PartPlate.cpp)
+
+
+def compute_plate_cols(n):
+    """Grid column count Orca uses for n plates (PartPlate.hpp compute_colum_count):
+    round(sqrt(n)), rounded up when sqrt is above the rounded value.
+    1->1, 2..4->2, 5..9->3, 10..16->4."""
+    v = math.sqrt(n)
+    r = round(v)
+    return int(r + 1) if v > r else int(r)
+
+
+def plate_cell_center(k, cols, bed):
+    """Bed-center of plate k (1-based document order) in the plate grid."""
+    col, row = (k - 1) % cols, (k - 1) // cols
+    stride = 1.0 + PLATE_GRID_GAP
+    return (bed.center_x + col * bed.width * stride,
+            bed.center_y - row * bed.height * stride)
+
+
+def _plate_object_ids(plate_elem):
+    """object_id values listed by a <plate> block's <model_instance> children."""
+    ids = []
+    for mi in plate_elem.findall('model_instance'):
+        for md in mi.findall('metadata'):
+            if md.get('key') == 'object_id':
+                ids.append(md.get('value'))
+    return ids
+
+
+def convert_single_file(input_path, output_path, user_colors, merge_plates=True):
     """
-    Convert a single Bambu .3mf file to Snapmaker U1 format.
+    Convert a Bambu .3mf file to Snapmaker U1 format.
 
     Args:
         input_path: Path to the input Bambu .3mf file
         output_path: Path where the converted file will be saved
         user_colors: Dict {original_filament_id: {color: #hex, type: PLA}}
+        merge_plates: When True (default) a multi-plate file is KEPT as one
+            multi-plate U1 file, each plate recentered onto its Orca grid cell.
+            When False a multi-plate file is refused (used by the legacy
+            split-then-convert-each path, which feeds one plate at a time).
 
     Returns:
         (success, error_message) - Tuple with success bool and error string if failed
@@ -861,20 +944,24 @@ def convert_single_file(input_path, output_path, user_colors):
     except Exception as e:
         return (False, f'Could not read original project settings: {e}')
 
-    # 2. Multi-plate policy: the U1 prints a single plate. Refuse (loudly) any
-    #    file that carries more than one plate rather than silently collapsing
-    #    or mis-placing objects. Per-plate splitting is a planned follow-up.
+    # 2. Multi-plate handling. The U1 prints one plate at a time, but Snapmaker
+    #    Orca keeps all plates in ONE file (a grid), so with merge_plates we KEEP
+    #    every plate and recenter each onto its grid cell (built below, once the
+    #    bed and build items are known). The legacy split path passes
+    #    merge_plates=False and still refuses multi-plate (it feeds one plate at
+    #    a time). n_plates<=1 -> single-plate, unchanged.
+    n_plates = 1
     try:
         with zipfile.ZipFile(input_path, 'r') as z_orig:
             if 'Metadata/model_settings.config' in z_orig.namelist():
                 ms_root = ET.fromstring(
                     z_orig.read('Metadata/model_settings.config').decode('utf-8')
                 )
-                plate_count = count_plates(ms_root)
-                if plate_count > 1:
+                n_plates = count_plates(ms_root)
+                if n_plates > 1 and not merge_plates:
                     return (
                         False,
-                        f"{src_name} contains {plate_count} plates; the U1 prints "
+                        f"{src_name} contains {n_plates} plates; the U1 prints "
                         f"one plate — re-export a single plate",
                     )
     except ConversionError:
@@ -1046,7 +1133,28 @@ def convert_single_file(input_path, output_path, user_colors):
                 # for their bounding boxes and copied byte-for-byte on output).
                 _read_submodel = make_zip_submodel_reader(zin)
 
-                recenter_and_drop_model(model_3d_root, _read_submodel, bed)
+                # For a multi-plate file kept as one file, recenter each plate's
+                # items onto its Orca grid cell. Validate membership up front
+                # (like split_plates) so a bad file fails before any write.
+                plate_groups = None
+                if n_plates > 1 and merge_plates:
+                    cols = compute_plate_cols(n_plates)
+                    build_ids = {it.get('objectid')
+                                 for it in _collect_build_items(model_3d_root)}
+                    plate_groups = []
+                    for k, plate in enumerate(ms_root.findall('.//plate'), start=1):
+                        ids = _plate_object_ids(plate)
+                        if not ids:
+                            raise ConversionError(
+                                f"plate {k} lists no model_instance objects; nothing to place.")
+                        missing = sorted(i for i in ids if i not in build_ids)
+                        if missing:
+                            raise ConversionError(
+                                f"plate {k} references object_id(s) {missing} with no "
+                                f"matching build <item>; the file is inconsistent.")
+                        plate_groups.append((set(ids), plate_cell_center(k, cols, bed)))
+
+                recenter_and_drop_model(model_3d_root, _read_submodel, bed, plate_groups)
 
                 modified_3d_model = ET.tostring(
                     model_3d_root, encoding='utf-8', xml_declaration=True
@@ -1117,6 +1225,9 @@ def convert_single_file(input_path, output_path, user_colors):
                 # Snapmaker Orca previously rejected.
                 _resize_filament_settings(combined_project_settings, num_filaments)
 
+                # Per-plate arrays (wipe_tower_x/y) must have one entry per plate.
+                _resize_plate_settings(combined_project_settings, n_plates)
+
                 # Convert to JSON string
                 combined_project_settings_str = json.dumps(combined_project_settings, indent=4, ensure_ascii=False)
                 # --- End Project Settings Modification ---
@@ -1132,6 +1243,10 @@ def convert_single_file(input_path, output_path, user_colors):
                         zout.writestr(item, modified_model_settings)
                     elif item.filename == '3D/3dmodel.model' and modified_3d_model is not None:
                         zout.writestr(item, modified_3d_model)
+                    elif re.match(r'Metadata/plate_\d+\.json$', item.filename):
+                        # Per-plate slice caches hold stale object bboxes after we
+                        # recenter; they are optional, so drop them (Orca rebuilds).
+                        continue
                     else:
                         # Copy all other files as-is
                         content = zin.read(item.filename)
@@ -1235,7 +1350,19 @@ def convert_or_split_plates(input_path, output_path, user_colors, base_name='mod
             _save(output_path, f"{base_name}_U1.3mf")
         return (ok, output_path if ok else None, None if ok else err)
 
-    # Multi-plate: split into single-plate files, convert each, bundle into a ZIP.
+    # Multi-plate: keep ALL plates in ONE file (Orca's plate grid). Preferred
+    # output — one download, plates selectable in Orca.
+    merged_ok, merged_err = convert_single_file(
+        input_path, output_path, user_colors, merge_plates=True)
+    if merged_ok:
+        _clear_stale_outputs(save_dir, base_name)
+        _save(output_path, f"{base_name}_U1.3mf")
+        return (True, output_path, None)
+    # A plate that can't fit (or other failure) drops us to the legacy path:
+    # split into single-plate files, convert each, bundle a ZIP with a warning.
+    print(f"WARN: one-file multi-plate convert failed ({merged_err}); "
+          f"falling back to per-plate split.")
+
     import tempfile
     from split_plates import split_plates
     with tempfile.TemporaryDirectory() as td:
