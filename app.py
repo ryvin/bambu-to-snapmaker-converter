@@ -46,13 +46,18 @@ U1_PER_FILAMENT_EXTRA_KEYS = frozenset({
     'textured_plate_temp', 'textured_plate_temp_initial_layer',
 })
 
-# Model-defining print settings carried over from the SOURCE (not taken from the
-# U1 template). layer_height and the first-layer height set the model's layer
-# grid — which also determines whether the by-height tool-changes in
-# custom_gcode_per_layer.xml land on a layer boundary and fire. Forcing the
-# template's 0.2/0.25 silently halves a fine (e.g. 0.08mm) lithophane's layers
-# and drops every color change, so the model prints as a single color.
-U1_PRESERVE_FROM_SOURCE = ('layer_height', 'initial_layer_print_height')
+# Model/process settings carried over from the SOURCE (not taken from the U1
+# template), because they define HOW the model is sliced, not the printer:
+#   - layer_height / initial_layer_print_height: the model's layer grid, which
+#     also determines whether custom_gcode_per_layer.xml by-height tool-changes
+#     land on a layer boundary and fire. Template's 0.2/0.25 silently halves a
+#     fine (0.08mm) lithophane and drops every color change.
+#   - single_extruder_multi_material: '1' means color changes happen via filament
+#     SWAP on one nozzle (the U1's mode; custom_gcode uses mode="MultiAsSingle").
+#     The template's '0' makes Orca treat it as a multi-tool printer and IGNORE
+#     the MultiAsSingle tool-changes -> the multi-color print comes out one color.
+U1_PRESERVE_FROM_SOURCE = (
+    'layer_height', 'initial_layer_print_height', 'single_extruder_multi_material')
 
 # Value Snapmaker Orca writes into new inter-filament flush cells when it grows
 # a 4-filament project to N (any positive value loads; Orca recomputes from

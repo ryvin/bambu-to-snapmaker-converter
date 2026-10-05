@@ -741,7 +741,8 @@ def test_source_layer_height_is_preserved_not_template(tmp_path):
     boundaries so they stop firing."""
     src = str(tmp_path / "fine.3mf")
     make_single_plate_3mf(src, extra_project_settings={
-        "layer_height": "0.08", "initial_layer_print_height": "0.16"})
+        "layer_height": "0.08", "initial_layer_print_height": "0.16",
+        "single_extruder_multi_material": "1"})
     out = str(tmp_path / "fine_U1.3mf")
     ok, err = convert_single_file(src, out, DEFAULT_COLORS)
     assert ok, err
@@ -749,6 +750,8 @@ def test_source_layer_height_is_preserved_not_template(tmp_path):
         ps = json.loads(z.read("Metadata/project_settings.config").decode("utf-8"))
     assert ps["layer_height"] == "0.08"                 # source value, not template's 0.2
     assert ps["initial_layer_print_height"] == "0.16"
+    # SEMM=1 must survive, or Orca drops the MultiAsSingle by-layer color changes.
+    assert ps["single_extruder_multi_material"] == "1"
 
 
 def test_source_without_layer_height_uses_template(tmp_path):
