@@ -46,6 +46,14 @@ U1_PER_FILAMENT_EXTRA_KEYS = frozenset({
     'textured_plate_temp', 'textured_plate_temp_initial_layer',
 })
 
+# Model-defining print settings carried over from the SOURCE (not taken from the
+# U1 template). layer_height and the first-layer height set the model's layer
+# grid — which also determines whether the by-height tool-changes in
+# custom_gcode_per_layer.xml land on a layer boundary and fire. Forcing the
+# template's 0.2/0.25 silently halves a fine (e.g. 0.08mm) lithophane's layers
+# and drops every color change, so the model prints as a single color.
+U1_PRESERVE_FROM_SOURCE = ('layer_height', 'initial_layer_print_height')
+
 # Value Snapmaker Orca writes into new inter-filament flush cells when it grows
 # a 4-filament project to N (any positive value loads; Orca recomputes from
 # colors on demand). Verified against Orca's own 4->7 re-save.
@@ -1165,6 +1173,14 @@ def convert_single_file(input_path, output_path, user_colors, merge_plates=True)
                 # Combine U1 printer settings with user-selected filament colors
                 # Start with U1 template settings (for printer configuration)
                 combined_project_settings = copy.deepcopy(u1_project_settings_json)
+
+                # Preserve the source's layer grid (resolution + the Z-heights
+                # the custom_gcode_per_layer.xml color changes align to). Without
+                # this the U1 template's coarser default silently drops layers
+                # and every by-height tool change.
+                for _k in U1_PRESERVE_FROM_SOURCE:
+                    if _k in original_project_settings:
+                        combined_project_settings[_k] = original_project_settings[_k]
 
                 # Get the number of filaments from the original file
                 original_filaments = parse_bambu_filaments(input_path)
