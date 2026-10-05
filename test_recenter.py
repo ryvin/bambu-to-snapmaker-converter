@@ -141,7 +141,8 @@ def _submodel_xml(object_id, aabb):
 
 def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
                           no_slice_info=False,
-                          printer="Bambu Lab X1 Carbon"):
+                          printer="Bambu Lab X1 Carbon",
+                          extra_project_settings=None):
     """
     Build a minimal valid single-plate Bambu-style .3mf that uses
     components -> submodels (like real BambuStudio output). Two objects:
@@ -224,15 +225,16 @@ def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
             f"</plate></config>"
         )
 
-    project_settings = json.dumps(
-        {
-            "printer_model": printer,
-            "printer_settings_id": printer,
-            "different_settings_to_system": [],
-            "filament_colour": ["#FF0000", "#00FF00"],
-            "filament_type": ["PLA", "PLA"],
-        }
-    )
+    _ps = {
+        "printer_model": printer,
+        "printer_settings_id": printer,
+        "different_settings_to_system": [],
+        "filament_colour": ["#FF0000", "#00FF00"],
+        "filament_type": ["PLA", "PLA"],
+    }
+    if extra_project_settings:
+        _ps.update(extra_project_settings)
+    project_settings = json.dumps(_ps)
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("3D/3dmodel.model", main)
@@ -730,3 +732,32 @@ def test_zip_submodel_reader_missing_returns_none(tmp_path):
     with zipfile.ZipFile(p) as zin:
         read = make_zip_submodel_reader(zin)
         assert read("/3D/Objects/nope.model") is None
+
+
+def test_source_layer_height_is_preserved_not_template(tmp_path):
+    """The source's layer grid must survive conversion. Forcing the U1 template's
+    coarser 0.2mm (the old behaviour) halves a fine lithophane's layers and
+    knocks custom_gcode_per_layer.xml by-height color changes off their layer
+    boundaries so they stop firing."""
+    src = str(tmp_path / "fine.3mf")
+    make_single_plate_3mf(src, extra_project_settings={
+        "layer_height": "0.08", "initial_layer_print_height": "0.16"})
+    out = str(tmp_path / "fine_U1.3mf")
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+    with zipfile.ZipFile(out) as z:
+        ps = json.loads(z.read("Metadata/project_settings.config").decode("utf-8"))
+    assert ps["layer_height"] == "0.08"                 # source value, not template's 0.2
+    assert ps["initial_layer_print_height"] == "0.16"
+
+
+def test_source_without_layer_height_uses_template(tmp_path):
+    """When the source omits layer settings, the template's value stands (no crash)."""
+    src = str(tmp_path / "plain.3mf")
+    make_single_plate_3mf(src)                            # no layer_height in project_settings
+    out = str(tmp_path / "plain_U1.3mf")
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+    with zipfile.ZipFile(out) as z:
+        ps = json.loads(z.read("Metadata/project_settings.config").decode("utf-8"))
+    assert ps["layer_height"] == "0.2"                   # template default preserved
