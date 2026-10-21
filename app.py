@@ -1094,15 +1094,36 @@ def convert_single_file(input_path, output_path, user_colors, merge_plates=True)
                 model_settings_content = zin.read('Metadata/model_settings.config')
                 model_root = ET.fromstring(model_settings_content.decode('utf-8'))
 
-                # Find all extruder metadata tags and update them. Every
-                # painted-region extruder reference MUST remap to a kept
-                # filament; an unmapped reference would silently point at a
-                # non-existent extruder and corrupt the multi-color output.
+                # Find all extruder metadata tags and update them.
+                #
+                # The extruder index is 1-based (value "1" == first filament).
+                # BambuStudio/OrcaSlicer reserve "0" as the "default/unassigned"
+                # sentinel and also tolerate any value > N (the filament count),
+                # normalizing BOTH to the first extruder on load
+                # (OrcaSlicer src/libslic3r/Format/bbs_3mf.cpp: extruder_id == 0
+                # || extruder_id > max_filament_id -> 1). So these are valid,
+                # common values — NOT uncovered painted regions — and must map
+                # to the first kept filament rather than abort the conversion.
+                # An unmapped value that IS in range (1..N) means the user
+                # deselected a filament that a region actually paints, which is
+                # a genuine coverage error and still fails loudly.
+                num_source_filaments = len(original_filaments)
                 for metadata in model_root.findall('.//metadata[@key="extruder"]'):
                     old_extruder = metadata.get('value')
                     if old_extruder in id_mapping:
                         metadata.set('value', id_mapping[old_extruder])
+                        continue
+                    try:
+                        ext_int = int(old_extruder)
+                    except (TypeError, ValueError):
+                        ext_int = None
+                    # 0, negative, or out-of-range -> default (first) extruder,
+                    # exactly as the slicer itself normalizes it.
+                    if ext_int is None or ext_int <= 0 or ext_int > num_source_filaments:
+                        metadata.set('value', '1')
                     else:
+                        # In range (1..N) but not kept: a painted region points
+                        # at a filament the user deselected -> fail loudly.
                         raise ConversionError(
                             f"model_settings.config references extruder "
                             f"'{old_extruder}' which has no filament mapping "

@@ -142,7 +142,8 @@ def _submodel_xml(object_id, aabb):
 def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
                           no_slice_info=False,
                           printer="Bambu Lab X1 Carbon",
-                          extra_project_settings=None):
+                          extra_project_settings=None,
+                          obj200_extruder="2"):
     """
     Build a minimal valid single-plate Bambu-style .3mf that uses
     components -> submodels (like real BambuStudio output). Two objects:
@@ -197,7 +198,7 @@ def make_single_plate_3mf(path, plates=1, empty_slice_info=False,
         f"</part></object>"
         f'<object id="200">'
         f'<metadata key="name" value="obj b"/>'
-        f'<metadata key="extruder" value="2"/>'
+        f'<metadata key="extruder" value="{obj200_extruder}"/>'
         f'<part id="1" subtype="normal_part">'
         f'<metadata key="name" value="body"/>'
         f'<metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>'
@@ -524,6 +525,50 @@ def test_uncovered_painted_region_raises(tmp_path):
     ok, err = convert_single_file(src, out, colors)
     assert ok is False
     assert "2" in err and "extruder" in err.lower()
+
+
+# ===========================================================================
+# Test 12b: extruder value "0" (the BambuStudio "default/unassigned" sentinel)
+# must NOT be rejected — OrcaSlicer itself normalizes 0 -> the first extruder
+# (bbs_3mf.cpp: extruder_id == 0 || > max_filament_id -> 1). Real user file
+# SH+MB+Fixed+blade.3mf carried an object with extruder="0" and aborted the
+# whole conversion. 0 must remap to the first kept filament ("1").
+# ===========================================================================
+def test_extruder_zero_maps_to_default_not_rejected(tmp_path):
+    src = str(tmp_path / "ext0.3mf")
+    out = str(tmp_path / "ext0_out.3mf")
+    # object 200 carries the "default/unassigned" sentinel.
+    make_single_plate_3mf(src, plates=1, obj200_extruder="0")
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err  # must NOT raise "no filament mapping" on the 0 sentinel
+
+    with zipfile.ZipFile(out) as z:
+        ms = ET.fromstring(z.read("Metadata/model_settings.config").decode("utf-8"))
+    refs = [m.get("value") for m in ms.findall('.//metadata[@key="extruder"]')]
+    # The 0 sentinel landed on the first extruder; no stray 0 survives.
+    assert "0" not in refs
+    assert "1" in refs
+
+
+# ===========================================================================
+# Test 12c: an out-of-range extruder (> number of filaments in the file) is
+# also a sentinel OrcaSlicer clamps to the first extruder, not an error.
+# ===========================================================================
+def test_extruder_out_of_range_maps_to_default(tmp_path):
+    src = str(tmp_path / "extN.3mf")
+    out = str(tmp_path / "extN_out.3mf")
+    # Only filaments 1 and 2 exist; 9 is out of range -> default "1".
+    make_single_plate_3mf(src, plates=1, obj200_extruder="9")
+
+    ok, err = convert_single_file(src, out, DEFAULT_COLORS)
+    assert ok, err
+
+    with zipfile.ZipFile(out) as z:
+        ms = ET.fromstring(z.read("Metadata/model_settings.config").decode("utf-8"))
+    refs = [m.get("value") for m in ms.findall('.//metadata[@key="extruder"]')]
+    assert "9" not in refs
+    assert "1" in refs
 
 
 # ===========================================================================
