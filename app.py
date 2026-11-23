@@ -10,7 +10,8 @@ import math
 import traceback
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from flask import Flask, render_template, request, send_file, jsonify
+from flask import Flask, render_template, request, send_file, jsonify, abort
+from werkzeug.security import safe_join
 from history import HistoryManager
 
 # Per-filament project_settings.config keys that do NOT start with 'filament_'
@@ -1651,9 +1652,30 @@ def batch_convert():
     })
 
 
+def safe_upload_path(base, filename):
+    """Join filename under base, or None if it would leave base.
+
+    Refuses '..', absolute and drive paths and Windows separators (werkzeug's
+    safe_join rules), a ':' or NUL byte, and any path that resolves outside base
+    once symlinks are followed. Matches the Rust port (rust/DECISIONS.md ADR-012).
+    """
+    if ':' in filename or '\0' in filename or '\\' in filename:
+        return None
+    filepath = safe_join(base, filename)
+    if filepath is None:
+        return None
+    real_base = os.path.realpath(base)
+    real_path = os.path.realpath(filepath)
+    if os.path.commonpath([real_base, real_path]) != real_base:
+        return None
+    return filepath
+
+
 @app.route('/download/<path:filename>')
 def download_file(filename):
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    filepath = safe_upload_path(app.config['UPLOAD_FOLDER'], filename)
+    if filepath is None:
+        abort(404)
 
     # Use provided download name or determine based on file type
     download_name = request.args.get('name')
